@@ -2144,7 +2144,7 @@ app.post('/api/objectives/:id/subscribe', authenticate, requireOrganization, asy
     
     // Check if objective exists and is in same organization
     const objective = await dbGet(
-      'SELECT id, organization_id FROM objectives WHERE id = ?',
+      'SELECT id, title, organization_id FROM objectives WHERE id = ?',
       [id]
     );
     
@@ -2175,6 +2175,15 @@ app.post('/api/objectives/:id/subscribe', authenticate, requireOrganization, asy
         user_id: userId,
         objective_id: id
       });
+    
+    // Create a notification for the user that they subscribed to this objective
+    await createNotification(
+      userId,
+      'objective_update',
+      'Subscribed to objective',
+      `You subscribed to "${objective.title}". You'll receive notifications for updates to this objective.`,
+      id
+    );
     
     res.status(201).json({ message: 'Subscribed to objective', subscribed: true });
   } catch (error) {
@@ -2385,6 +2394,23 @@ app.patch('/api/notifications/mark-all-read', async (req, res) => {
     if (error) throw error;
     
     res.json({ message: 'All notifications marked as read' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete('/api/notifications/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    const { error } = await supabase
+      .from('notifications')
+      .delete()
+      .eq('id', id);
+    
+    if (error) throw error;
+    
+    res.json({ message: 'Notification deleted successfully' });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
