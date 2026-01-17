@@ -13,6 +13,7 @@ import { hashPassword, comparePassword, validatePassword } from './utils/passwor
 import { generateToken, generateRandomToken, hashToken } from './utils/jwt.js';
 import { sendVerificationEmail, sendInvitationEmail, sendPasswordResetEmail } from './utils/email.js';
 import { authenticate, optionalAuthenticate, authorize, requireOrganization, requireAdminOrManager } from './middleware/auth.js';
+import { uploadFile, deleteFile, getPublicUrl, initializeStorage } from './utils/storage.js';
 
 // Notification helper functions
 async function parseMentions(content) {
@@ -93,6 +94,12 @@ async function notifyObjectiveStakeholders(objectiveId, type, title, message, ex
       .select('user_id')
       .eq('objective_id', objectiveId);
     
+    // Get subscribers
+    const { data: subscriptions } = await supabase
+      .from('objective_subscriptions')
+      .select('user_id')
+      .eq('objective_id', objectiveId);
+    
     const userIds = new Set();
     
     // Add owner
@@ -105,6 +112,15 @@ async function notifyObjectiveStakeholders(objectiveId, type, title, message, ex
       contributors.forEach(c => {
         if (c.user_id && c.user_id !== excludeUserId) {
           userIds.add(c.user_id);
+        }
+      });
+    }
+    
+    // Add subscribers
+    if (subscriptions) {
+      subscriptions.forEach(s => {
+        if (s.user_id && s.user_id !== excludeUserId) {
+          userIds.add(s.user_id);
         }
       });
     }
@@ -202,6 +218,9 @@ app.use('/uploads', express.static(path.join(__dirname, 'public', 'uploads')));
       console.error('Please ensure SUPABASE_URL and SUPABASE_ANON_KEY are set in your .env file');
     } else {
       console.log('Connected to Supabase database');
+      
+      // Initialize storage bucket
+      await initializeStorage();
       
       // Check if companies table exists
       const { error: tableError } = await supabase.from('companies').select('id').limit(1);
@@ -424,6 +443,7 @@ app.post('/api/objectives', authenticate, requireOrganization, async (req, res) 
       description,
       owner_id,
       department_id,
+      team_id, // Support team_id as alias for department_id
       parent_objective_id,
       status = 'Active',
       priority = 'Medium',
@@ -434,39 +454,84 @@ app.post('/api/objectives', authenticate, requireOrganization, async (req, res) 
       tags = []
     } = req.body;
 
+    // Use team_id if provided, otherwise fall back to department_id
+    const finalDepartmentId = team_id !== undefined ? team_id : department_id;
+
     const id = uuidv4();
     // Tags stored as JSONB array in Supabase
     const tagsArray = Array.isArray(tags) ? tags : [];
 
+    // Normalize null/empty values - convert empty strings to null
+    const normalizeValue = (val) => {
+      if (val === '' || val === undefined) return null;
+      return val;
+    };
+
+    const insertData = {
+      id,
+      title: title || '',
+      description: normalizeValue(description),
+      owner_id: normalizeValue(owner_id),
+      department_id: normalizeValue(finalDepartmentId),
+      parent_objective_id: normalizeValue(parent_objective_id),
+      status: status || 'Active',
+      priority: priority || 'Medium',
+      start_date: normalizeValue(start_date),
+      due_date: normalizeValue(due_date),
+      target_value: normalizeValue(target_value),
+      current_value: normalizeValue(current_value),
+      tags: tagsArray,
+      organization_id: req.organizationId
+    };
+
+    // Validate required fields
+    if (!insertData.title || insertData.title.trim() === '') {
+      return res.status(400).json({ error: 'Title is required' });
+    }
+
+    if (!insertData.organization_id) {
+      console.error('Missing organization_id in request:', {
+        userId: req.user?.id,
+        userOrgId: req.user?.organizationId,
+        reqOrgId: req.organizationId
+      });
+      return res.status(400).json({ error: 'Organization ID is required' });
+    }
+
+    console.log('Creating objective with data:', JSON.stringify(insertData, null, 2));
+
     const { data: objective, error } = await supabase
       .from('objectives')
-      .insert({
-        id,
-        title,
-        description,
-        owner_id,
-        department_id,
-        parent_objective_id,
-        status,
-        priority,
-        start_date,
-        due_date,
-        target_value,
-        current_value,
-        tags: tagsArray,
-        organization_id: req.organizationId
-      })
+      .insert(insertData)
       .select()
       .single();
 
-    if (error) throw error;
+    if (error) {
+      console.error('Supabase error creating objective:', error);
+      console.error('Error details:', JSON.stringify(error, null, 2));
+      throw error;
+    }
 
     // Ensure tags is an array
     objective.tags = Array.isArray(objective.tags) ? objective.tags : [];
 
     res.status(201).json(objective);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    console.error('Error creating objective:', error);
+    console.error('Error stack:', error.stack);
+    console.error('Request body:', req.body);
+    console.error('User:', req.user);
+    console.error('Organization ID:', req.organizationId);
+    
+    // Provide more detailed error message
+    const errorMessage = error.message || 'Unknown error occurred';
+    const errorDetails = error.details || error.hint || '';
+    
+    res.status(500).json({ 
+      error: errorMessage,
+      details: errorDetails,
+      code: error.code || 'UNKNOWN_ERROR'
+    });
   }
 });
 
@@ -478,6 +543,7 @@ app.put('/api/objectives/:id', async (req, res) => {
       description,
       owner_id,
       department_id,
+      team_id, // Support team_id as alias for department_id
       parent_objective_id,
       status,
       priority,
@@ -495,7 +561,12 @@ app.put('/api/objectives/:id', async (req, res) => {
     if (title !== undefined) updates.title = title;
     if (description !== undefined) updates.description = description;
     if (owner_id !== undefined) updates.owner_id = owner_id;
-    if (department_id !== undefined) updates.department_id = department_id;
+    // Support both team_id and department_id (team_id takes precedence)
+    if (team_id !== undefined) {
+      updates.department_id = team_id;
+    } else if (department_id !== undefined) {
+      updates.department_id = department_id;
+    }
     if (parent_objective_id !== undefined) updates.parent_objective_id = parent_objective_id;
     if (status !== undefined) updates.status = status;
     if (priority !== undefined) updates.priority = priority;
@@ -1237,6 +1308,80 @@ app.delete('/api/departments/:id', async (req, res) => {
   }
 });
 
+// Teams endpoints (aliases for departments for backward compatibility)
+app.get('/api/teams', async (req, res) => {
+  try {
+    const teams = await dbAll('SELECT * FROM departments ORDER BY name');
+    res.json(teams);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/teams/:id', async (req, res) => {
+  try {
+    const team = await dbGet('SELECT * FROM departments WHERE id = ?', [req.params.id]);
+    if (!team) {
+      return res.status(404).json({ error: 'Team not found' });
+    }
+    res.json(team);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/teams', async (req, res) => {
+  try {
+    const { name, description, manager_id } = req.body;
+    const id = uuidv4();
+
+    await dbRun(
+      'INSERT INTO departments (id, name, description, manager_id) VALUES (?, ?, ?, ?)',
+      [id, name, description || null, manager_id || null]
+    );
+
+    const team = await dbGet('SELECT * FROM departments WHERE id = ?', [id]);
+    res.status(201).json(team);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.put('/api/teams/:id', async (req, res) => {
+  try {
+    const { name, description, manager_id } = req.body;
+    const updates = [];
+    const params = [];
+
+    if (name !== undefined) { updates.push('name = ?'); params.push(name); }
+    if (description !== undefined) { updates.push('description = ?'); params.push(description); }
+    if (manager_id !== undefined) { updates.push('manager_id = ?'); params.push(manager_id || null); }
+
+    params.push(req.params.id);
+
+    if (updates.length === 0) {
+      return res.status(400).json({ error: 'No fields to update' });
+    }
+
+    const query = `UPDATE departments SET ${updates.join(', ')} WHERE id = ?`;
+    await dbRun(query, params);
+
+    const team = await dbGet('SELECT * FROM departments WHERE id = ?', [req.params.id]);
+    res.json(team);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete('/api/teams/:id', async (req, res) => {
+  try {
+    await dbRun('DELETE FROM departments WHERE id = ?', [req.params.id]);
+    res.json({ message: 'Team deleted successfully' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Company endpoints
 app.get('/api/company', async (req, res) => {
   try {
@@ -1244,7 +1389,21 @@ app.get('/api/company', async (req, res) => {
     if (companies.length === 0) {
       return res.json(null);
     }
-    res.json(companies[0]);
+    
+    // Ensure logo_url is a full URL (convert old local paths to Supabase URLs if needed)
+    const company = companies[0];
+    if (company.logo_url && company.logo_url.startsWith('/uploads/')) {
+      // Old local path - try to get public URL from Supabase Storage
+      try {
+        company.logo_url = getPublicUrl(company.logo_url);
+      } catch (error) {
+        console.warn('Could not convert logo URL:', error);
+        // Keep original URL or set to null
+        company.logo_url = null;
+      }
+    }
+    
+    res.json(company);
   } catch (error) {
     if (error.code === 'PGRST116' || error.message.includes('companies') || error.message.includes('relation') || error.message.includes('table')) {
       res.status(500).json({ 
@@ -1356,7 +1515,7 @@ app.put('/api/company', async (req, res) => {
   }
 });
 
-// Logo upload endpoint
+// Logo upload endpoint - using Supabase Storage
 app.post('/api/company/logo', upload.single('logo'), async (req, res) => {
   try {
     if (!req.file) {
@@ -1366,16 +1525,37 @@ app.post('/api/company/logo', upload.single('logo'), async (req, res) => {
     // Get existing company to update, or create new one
     const existing = await dbAll('SELECT * FROM companies ORDER BY created_at DESC LIMIT 1');
     
-    // Delete old logo if exists
+    // Delete old logo if exists (from Supabase Storage)
     if (existing.length > 0 && existing[0].logo_url) {
-      const oldLogoPath = path.join(__dirname, 'public', existing[0].logo_url);
-      if (fs.existsSync(oldLogoPath)) {
-        fs.unlinkSync(oldLogoPath);
+      try {
+        await deleteFile(existing[0].logo_url);
+      } catch (deleteError) {
+        console.warn('Could not delete old logo:', deleteError);
+        // Continue even if deletion fails
       }
     }
     
-    // Create logo URL path
-    const logoUrl = `/uploads/logos/${req.file.filename}`;
+    // Upload to Supabase Storage
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    const ext = path.extname(req.file.originalname);
+    const filename = `logo-${uniqueSuffix}${ext}`;
+    
+    let logoUrl;
+    try {
+      // Read file buffer
+      const fileBuffer = fs.readFileSync(req.file.path);
+      const { url } = await uploadFile(fileBuffer, filename);
+      logoUrl = url;
+      
+      // Delete local temp file
+      fs.unlinkSync(req.file.path);
+    } catch (uploadError) {
+      // Clean up local file
+      if (fs.existsSync(req.file.path)) {
+        fs.unlinkSync(req.file.path);
+      }
+      throw new Error(`Failed to upload to storage: ${uploadError.message}`);
+    }
     
     if (existing.length > 0) {
       // Update existing company
@@ -1399,11 +1579,8 @@ app.post('/api/company/logo', upload.single('logo'), async (req, res) => {
     }
   } catch (error) {
     // Delete uploaded file if there was an error
-    if (req.file) {
-      const filePath = path.join(__dirname, 'public', 'uploads', 'logos', req.file.filename);
-      if (fs.existsSync(filePath)) {
-        fs.unlinkSync(filePath);
-      }
+    if (req.file && fs.existsSync(req.file.path)) {
+      fs.unlinkSync(req.file.path);
     }
     if (error.code === 'PGRST116' || error.message.includes('companies') || error.message.includes('relation') || error.message.includes('table')) {
       res.status(500).json({ 
@@ -1599,12 +1776,17 @@ function applyFieldMapping(payload, fieldMapping) {
 }
 
 // Rate limiting for auth endpoints
+// More lenient for development, stricter for production
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 5, // 5 requests per window
+  max: process.env.NODE_ENV === 'production' ? 5 : 20, // 5 in production, 20 in development
   message: 'Too many authentication attempts, please try again later.',
   standardHeaders: true,
   legacyHeaders: false,
+  skip: (req) => {
+    // Skip rate limiting in development for localhost
+    return process.env.NODE_ENV !== 'production' && req.ip === '::1';
+  }
 });
 
 // Authentication endpoints
@@ -1949,6 +2131,163 @@ app.post('/api/auth/logout', authenticate, async (req, res) => {
     res.json({ message: 'Logged out successfully' });
   } catch (error) {
     console.error('Logout error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Objective Subscription endpoints
+// Subscribe to an objective
+app.post('/api/objectives/:id/subscribe', authenticate, requireOrganization, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user.id;
+    
+    // Check if objective exists and is in same organization
+    const objective = await dbGet(
+      'SELECT id, organization_id FROM objectives WHERE id = ?',
+      [id]
+    );
+    
+    if (!objective) {
+      return res.status(404).json({ error: 'Objective not found' });
+    }
+    
+    if (objective.organization_id !== req.organizationId) {
+      return res.status(403).json({ error: 'Cannot subscribe to objectives from other organizations' });
+    }
+    
+    // Check if already subscribed
+    const existing = await dbGet(
+      'SELECT id FROM objective_subscriptions WHERE user_id = ? AND objective_id = ?',
+      [userId, id]
+    );
+    
+    if (existing) {
+      return res.status(400).json({ error: 'Already subscribed to this objective' });
+    }
+    
+    // Create subscription
+    const subscriptionId = uuidv4();
+    await supabase
+      .from('objective_subscriptions')
+      .insert({
+        id: subscriptionId,
+        user_id: userId,
+        objective_id: id
+      });
+    
+    res.status(201).json({ message: 'Subscribed to objective', subscribed: true });
+  } catch (error) {
+    console.error('Subscribe error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Unsubscribe from an objective
+app.delete('/api/objectives/:id/subscribe', authenticate, requireOrganization, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user.id;
+    
+    // Check if subscription exists
+    const subscription = await dbGet(
+      'SELECT id FROM objective_subscriptions WHERE user_id = ? AND objective_id = ?',
+      [userId, id]
+    );
+    
+    if (!subscription) {
+      return res.status(404).json({ error: 'Not subscribed to this objective' });
+    }
+    
+    // Delete subscription
+    await supabase
+      .from('objective_subscriptions')
+      .delete()
+      .eq('id', subscription.id);
+    
+    res.json({ message: 'Unsubscribed from objective', subscribed: false });
+  } catch (error) {
+    console.error('Unsubscribe error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Check subscription status
+app.get('/api/objectives/:id/subscribe', authenticate, requireOrganization, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user.id;
+    
+    const subscription = await dbGet(
+      'SELECT id FROM objective_subscriptions WHERE user_id = ? AND objective_id = ?',
+      [userId, id]
+    );
+    
+    res.json({ subscribed: !!subscription });
+  } catch (error) {
+    console.error('Check subscription error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get objectives that the current user is subscribed to
+app.get('/api/objectives/subscribed', authenticate, requireOrganization, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    
+    console.log('Fetching subscribed objectives for user:', userId, 'org:', req.organizationId);
+    
+    // Get all subscriptions for this user using both methods to ensure compatibility
+    const { data: subscriptions, error: subError } = await supabase
+      .from('objective_subscriptions')
+      .select('objective_id')
+      .eq('user_id', userId);
+    
+    if (subError) {
+      console.error('Subscription query error:', subError);
+      throw subError;
+    }
+    
+    console.log('Found subscriptions:', subscriptions?.length || 0, subscriptions);
+    
+    if (!subscriptions || subscriptions.length === 0) {
+      console.log('No subscriptions found for user:', userId);
+      return res.json([]);
+    }
+    
+    const objectiveIds = subscriptions.map(s => s.objective_id);
+    console.log('Objective IDs to fetch:', objectiveIds);
+    
+    // Get objectives using Supabase
+    let queryBuilder = supabase
+      .from('objectives')
+      .select('*')
+      .in('id', objectiveIds)
+      .eq('organization_id', req.organizationId);
+    
+    // Apply filters if provided
+    if (req.query.status) {
+      queryBuilder = queryBuilder.eq('status', req.query.status);
+    }
+    
+    const { data: objectives, error: objError } = await queryBuilder.order('updated_at', { ascending: false });
+    
+    if (objError) {
+      console.error('Objectives query error:', objError);
+      throw objError;
+    }
+    
+    console.log('Found objectives:', objectives?.length || 0);
+    
+    // Ensure tags is an array for each objective
+    const objectivesWithTags = (objectives || []).map(obj => ({
+      ...obj,
+      tags: Array.isArray(obj.tags) ? obj.tags : (obj.tags ? JSON.parse(obj.tags) : [])
+    }));
+    
+    res.json(objectivesWithTags);
+  } catch (error) {
+    console.error('Error fetching subscribed objectives:', error);
     res.status(500).json({ error: error.message });
   }
 });

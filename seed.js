@@ -1,5 +1,6 @@
 import { v4 as uuidv4 } from 'uuid';
 import supabase from './db.js';
+import { hashPassword } from './utils/password.js';
 
 async function seedDatabase() {
   console.log('Starting database seed...');
@@ -32,15 +33,96 @@ async function seedDatabase() {
 
   console.log(`Created ${departments.length} departments`);
 
-  // Create users
+  // Create or get default organization for test user
+  let testOrgId = uuidv4();
+  const testOrgSlug = 'test-organization';
+  
+  // Check if test org already exists
+  const { data: existingOrg } = await supabase
+    .from('organizations')
+    .select('id')
+    .eq('slug', testOrgSlug)
+    .single();
+  
+  if (existingOrg) {
+    testOrgId = existingOrg.id;
+    console.log('Using existing test organization');
+  } else {
+    const { error: orgError } = await supabase.from('organizations').insert({
+      id: testOrgId,
+      name: 'Test Organization',
+      slug: testOrgSlug
+    });
+    if (orgError) {
+      console.error('Error creating test organization:', orgError);
+      throw orgError;
+    }
+    console.log('Created test organization');
+  }
+
+  // Create test user with password (email verified, ready to login)
+  const testPassword = 'test123456'; // Easy to remember password
+  const testPasswordHash = await hashPassword(testPassword);
+  const testUserId = uuidv4();
+  
+  const testUser = {
+    id: testUserId,
+    email: 'test@example.com',
+    name: 'Test User',
+    role: 'Admin',
+    department: departments[0].id,
+    password_hash: testPasswordHash,
+    email_verified: true,
+    organization_id: testOrgId
+  };
+
+  // Check if test user already exists
+  const { data: existingTestUser } = await supabase
+    .from('users')
+    .select('id')
+    .eq('email', 'test@example.com')
+    .single();
+  
+  if (existingTestUser) {
+    // Update existing test user
+    const { error: updateError } = await supabase
+      .from('users')
+      .update({
+        password_hash: testPasswordHash,
+        email_verified: true,
+        organization_id: testOrgId,
+        role: 'Admin'
+      })
+      .eq('id', existingTestUser.id);
+    
+    if (updateError) {
+      console.error('Error updating test user:', updateError);
+      throw updateError;
+    }
+    console.log('✅ Updated test user (ready to login)');
+    console.log('   Email: test@example.com');
+    console.log('   Password: test123456');
+  } else {
+    // Create new test user
+    const { error: testUserError } = await supabase.from('users').insert(testUser);
+    if (testUserError) {
+      console.error('Error creating test user:', testUserError);
+      throw testUserError;
+    }
+    console.log('✅ Created test user (ready to login)');
+    console.log('   Email: test@example.com');
+    console.log('   Password: test123456');
+  }
+
+  // Create other users (without passwords - they'll need to register or be invited)
   const users = [
-    { id: uuidv4(), email: 'alice.johnson@company.com', name: 'Alice Johnson', role: 'Manager', department: departments[0].id },
-    { id: uuidv4(), email: 'bob.smith@company.com', name: 'Bob Smith', role: 'Team Member', department: departments[0].id },
-    { id: uuidv4(), email: 'carol.white@company.com', name: 'Carol White', role: 'Manager', department: departments[1].id },
-    { id: uuidv4(), email: 'david.brown@company.com', name: 'David Brown', role: 'Team Member', department: departments[1].id },
-    { id: uuidv4(), email: 'emma.davis@company.com', name: 'Emma Davis', role: 'Manager', department: departments[2].id },
-    { id: uuidv4(), email: 'frank.miller@company.com', name: 'Frank Miller', role: 'Team Member', department: departments[2].id },
-    { id: uuidv4(), email: 'grace.wilson@company.com', name: 'Grace Wilson', role: 'Admin', department: null }
+    { id: uuidv4(), email: 'alice.johnson@company.com', name: 'Alice Johnson', role: 'Manager', department: departments[0].id, organization_id: testOrgId },
+    { id: uuidv4(), email: 'bob.smith@company.com', name: 'Bob Smith', role: 'Team Member', department: departments[0].id, organization_id: testOrgId },
+    { id: uuidv4(), email: 'carol.white@company.com', name: 'Carol White', role: 'Manager', department: departments[1].id, organization_id: testOrgId },
+    { id: uuidv4(), email: 'david.brown@company.com', name: 'David Brown', role: 'Team Member', department: departments[1].id, organization_id: testOrgId },
+    { id: uuidv4(), email: 'emma.davis@company.com', name: 'Emma Davis', role: 'Manager', department: departments[2].id, organization_id: testOrgId },
+    { id: uuidv4(), email: 'frank.miller@company.com', name: 'Frank Miller', role: 'Team Member', department: departments[2].id, organization_id: testOrgId },
+    { id: uuidv4(), email: 'grace.wilson@company.com', name: 'Grace Wilson', role: 'Admin', department: null, organization_id: testOrgId }
   ];
 
   const { error: usersError } = await supabase.from('users').insert(users);
@@ -49,7 +131,7 @@ async function seedDatabase() {
     throw usersError;
   }
 
-  console.log(`Created ${users.length} users`);
+  console.log(`Created ${users.length} additional users`);
 
   // Calculate future dates (relative to current date)
   const today = new Date();
@@ -334,7 +416,7 @@ async function seedDatabase() {
     }
   ];
 
-  // Prepare objectives with calculated progress_percentage and tags as arrays
+  // Prepare objectives with calculated progress_percentage, tags as arrays, and organization_id
   const objectivesToInsert = objectives.map(obj => {
     const progressPercentage = obj.target_value > 0 
       ? (obj.current_value / obj.target_value) * 100 
@@ -342,7 +424,8 @@ async function seedDatabase() {
     return {
       ...obj,
       progress_percentage: progressPercentage,
-      tags: obj.tags // Already an array - Supabase JSONB will handle it
+      tags: obj.tags, // Already an array - Supabase JSONB will handle it
+      organization_id: testOrgId // Assign all objectives to test organization
     };
   });
 
@@ -410,13 +493,18 @@ async function seedDatabase() {
   }
 
   console.log(`Created ${comments.length} comments`);
-  console.log('\nDatabase seeded successfully!');
-  console.log('\nSummary:');
+  console.log('\n✅ Database seeded successfully!');
+  console.log('\n📊 Summary:');
   console.log(`- ${departments.length} departments`);
-  console.log(`- ${users.length} users`);
+  console.log(`- ${users.length + 1} users (including test user)`);
   console.log(`- ${objectives.length} objectives`);
   console.log(`- ${keyResults.length} key results`);
   console.log(`- ${comments.length} comments`);
+  console.log('\n🔐 Test User Credentials:');
+  console.log('   Email: test@example.com');
+  console.log('   Password: test123456');
+  console.log('   Status: Email verified, ready to login!');
+  console.log('\n💡 You can use these credentials to login without email verification.');
 }
 
 seedDatabase().catch(console.error);
