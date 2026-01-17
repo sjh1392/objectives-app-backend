@@ -6,8 +6,119 @@ import multer from 'multer';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
+import rateLimit from 'express-rate-limit';
 import supabase from './db.js';
 import { dbRun, dbGet, dbAll } from './db-helpers.js';
+import { hashPassword, comparePassword, validatePassword } from './utils/password.js';
+import { generateToken, generateRandomToken, hashToken } from './utils/jwt.js';
+import { sendVerificationEmail, sendInvitationEmail, sendPasswordResetEmail } from './utils/email.js';
+import { authenticate, optionalAuthenticate, authorize, requireOrganization, requireAdminOrManager } from './middleware/auth.js';
+
+// Notification helper functions
+async function parseMentions(content) {
+  // Extract @mentions from content (format: @Username or @name)
+  const mentionRegex = /@([^\s@]+)/g;
+  const mentions = [];
+  let match;
+  
+  while ((match = mentionRegex.exec(content)) !== null) {
+    mentions.push(match[1].trim());
+  }
+  
+  return mentions;
+}
+
+async function getUserIdsFromMentions(mentions) {
+  if (!mentions || mentions.length === 0) return [];
+  
+  // Get all users to match mentions
+  const { data: users, error } = await supabase
+    .from('users')
+    .select('id, name, email');
+  
+  if (error || !users) return [];
+  
+  // Match mentions to user IDs (case-insensitive)
+  const userIds = [];
+  for (const mention of mentions) {
+    const user = users.find(u => 
+      u.name.toLowerCase() === mention.toLowerCase() ||
+      u.email.toLowerCase() === mention.toLowerCase()
+    );
+    if (user) {
+      userIds.push(user.id);
+    }
+  }
+  
+  return [...new Set(userIds)]; // Remove duplicates
+}
+
+async function createNotification(userId, type, title, message, objectiveId = null, commentId = null, progressUpdateId = null) {
+  try {
+    const id = uuidv4();
+    const { error } = await supabase
+      .from('notifications')
+      .insert({
+        id,
+        user_id: userId,
+        objective_id: objectiveId,
+        comment_id: commentId,
+        progress_update_id: progressUpdateId,
+        type,
+        title,
+        message,
+        read: false
+      });
+    
+    if (error) {
+      console.error('Error creating notification:', error);
+      return null;
+    }
+    
+    return id;
+  } catch (error) {
+    console.error('Error creating notification:', error);
+    return null;
+  }
+}
+
+async function notifyObjectiveStakeholders(objectiveId, type, title, message, excludeUserId = null, commentId = null, progressUpdateId = null) {
+  try {
+    // Get objective owner and contributors
+    const objective = await dbGet('SELECT owner_id FROM objectives WHERE id = ?', [objectiveId]);
+    if (!objective) return;
+    
+    const { data: contributors } = await supabase
+      .from('objective_contributors')
+      .select('user_id')
+      .eq('objective_id', objectiveId);
+    
+    const userIds = new Set();
+    
+    // Add owner
+    if (objective.owner_id && objective.owner_id !== excludeUserId) {
+      userIds.add(objective.owner_id);
+    }
+    
+    // Add contributors
+    if (contributors) {
+      contributors.forEach(c => {
+        if (c.user_id && c.user_id !== excludeUserId) {
+          userIds.add(c.user_id);
+        }
+      });
+    }
+    
+    // Create notifications for all stakeholders
+    const notificationPromises = Array.from(userIds).map(userId =>
+      createNotification(userId, type, title, message, objectiveId, commentId, progressUpdateId)
+    );
+    
+    await Promise.all(notificationPromises);
+  } catch (error) {
+    console.error('Error notifying stakeholders:', error);
+  }
+}
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -162,10 +273,15 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', message: 'Objectives API is running' });
 });
 
-// Get all objectives with optional filters
-app.get('/api/objectives', async (req, res) => {
+// Get all objectives with optional filters (organization-scoped)
+app.get('/api/objectives', optionalAuthenticate, async (req, res) => {
   try {
     let queryBuilder = supabase.from('objectives').select('*');
+    
+    // Filter by organization if user is authenticated
+    if (req.user && req.user.organizationId) {
+      queryBuilder = queryBuilder.eq('organization_id', req.user.organizationId);
+    }
 
     // Apply filters
     if (req.query.status) {
@@ -301,7 +417,7 @@ app.get('/api/objectives/:id', async (req, res) => {
 });
 
 // Create objective
-app.post('/api/objectives', async (req, res) => {
+app.post('/api/objectives', authenticate, requireOrganization, async (req, res) => {
   try {
     const {
       title,
@@ -337,7 +453,8 @@ app.post('/api/objectives', async (req, res) => {
         due_date,
         target_value,
         current_value,
-        tags: tagsArray
+        tags: tagsArray,
+        organization_id: req.organizationId
       })
       .select()
       .single();
@@ -428,7 +545,7 @@ app.delete('/api/objectives/:id', async (req, res) => {
 // Update progress
 app.patch('/api/objectives/:id/progress', async (req, res) => {
   try {
-    const { current_value, notes } = req.body;
+    const { current_value, notes, user_id } = req.body;
     const objectiveId = req.params.id;
 
     const objective = await dbGet('SELECT * FROM objectives WHERE id = ?', [objectiveId]);
@@ -440,6 +557,9 @@ app.patch('/api/objectives/:id/progress', async (req, res) => {
     const targetValue = objective.target_value || 100;
     const newProgress = targetValue > 0 ? (current_value / targetValue) * 100 : 0;
     const now = new Date().toISOString();
+    
+    // Use provided user_id or fall back to objective owner
+    const updateUserId = user_id || objective.owner_id;
 
     await supabase
       .from('objectives')
@@ -451,20 +571,36 @@ app.patch('/api/objectives/:id/progress', async (req, res) => {
       .eq('id', objectiveId);
 
     // Log progress update
+    const progressUpdateId = uuidv4();
     await supabase
       .from('progress_updates')
       .insert({
-        id: uuidv4(),
+        id: progressUpdateId,
         objective_id: objectiveId,
-        user_id: objective.owner_id,
+        user_id: updateUserId,
         previous_value: previousValue,
         new_value: current_value,
         notes: notes || ''
       });
 
+    // Get updater info for notifications
+    const { data: updater } = await supabase.from('users').select('name').eq('id', updateUserId).single();
+    const updaterName = updater?.name || 'Someone';
+    
+    // Notify objective owner and contributors (excluding updater)
+    await notifyObjectiveStakeholders(
+      objectiveId,
+      'progress_update',
+      `Progress updated on "${objective.title}"`,
+      `${updaterName} updated progress on "${objective.title}" from ${previousValue} to ${current_value}`,
+      updateUserId,
+      null,
+      progressUpdateId
+    );
+
     const updatedObjective = await dbGet('SELECT * FROM objectives WHERE id = ?', [objectiveId]);
     updatedObjective.tags = Array.isArray(updatedObjective.tags) ? updatedObjective.tags : (updatedObjective.tags ? JSON.parse(updatedObjective.tags) : []);
-
+    
     res.json(updatedObjective);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -773,18 +909,79 @@ app.get('/api/dashboard/manager-actions', async (req, res) => {
 });
 
 // Users and Departments
-app.get('/api/users', async (req, res) => {
+// Update user role (admin only)
+app.put('/api/users/:id/role', authenticate, authorize('Admin'), requireOrganization, async (req, res) => {
   try {
-    const users = await dbAll('SELECT * FROM users ORDER BY name');
+    const { id } = req.params;
+    const { role } = req.body;
+    
+    if (!role) {
+      return res.status(400).json({ error: 'Role is required' });
+    }
+    
+    const validRoles = ['Admin', 'Manager', 'Team Member', 'Viewer'];
+    if (!validRoles.includes(role)) {
+      return res.status(400).json({ error: 'Invalid role' });
+    }
+    
+    // Check user exists and is in same organization
+    const user = await dbGet(
+      'SELECT id, organization_id FROM users WHERE id = ?',
+      [id]
+    );
+    
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    if (user.organization_id !== req.organizationId) {
+      return res.status(403).json({ error: 'Cannot modify users from other organizations' });
+    }
+    
+    // Prevent removing last admin
+    if (role !== 'Admin' && user.role === 'Admin') {
+      const adminCount = await dbGet(
+        'SELECT COUNT(*) as count FROM users WHERE organization_id = ? AND role = ?',
+        [req.organizationId, 'Admin']
+      );
+      if (adminCount.count <= 1) {
+        return res.status(400).json({ error: 'Cannot remove last admin' });
+      }
+    }
+    
+    await supabase
+      .from('users')
+      .update({ role })
+      .eq('id', id);
+    
+    const updatedUser = await dbGet('SELECT * FROM users WHERE id = ?', [id]);
+    res.json(updatedUser);
+  } catch (error) {
+    console.error('Update user role error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/users', authenticate, requireOrganization, async (req, res) => {
+  try {
+    // Filter by organization
+    const users = await dbAll(
+      'SELECT id, email, name, role, department, avatar, created_at, last_login FROM users WHERE organization_id = ? ORDER BY name',
+      [req.organizationId]
+    );
     res.json(users);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-app.get('/api/users/:id', async (req, res) => {
+app.get('/api/users/:id', authenticate, requireOrganization, async (req, res) => {
   try {
-    const user = await dbGet('SELECT * FROM users WHERE id = ?', [req.params.id]);
+    // Ensure user is in same organization
+    const user = await dbGet(
+      'SELECT id, email, name, role, department, avatar, created_at, last_login FROM users WHERE id = ? AND organization_id = ?',
+      [req.params.id, req.organizationId]
+    );
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
     }
@@ -794,17 +991,28 @@ app.get('/api/users/:id', async (req, res) => {
   }
 });
 
-app.post('/api/users', async (req, res) => {
+app.post('/api/users', authenticate, requireAdminOrManager, requireOrganization, async (req, res) => {
   try {
     const { email, name, role = 'Team Member', department } = req.body;
+    
+    if (!email || !name) {
+      return res.status(400).json({ error: 'Email and name are required' });
+    }
+    
+    // Check if user already exists
+    const existingUser = await dbGet('SELECT id FROM users WHERE email = ?', [email.toLowerCase()]);
+    if (existingUser) {
+      return res.status(400).json({ error: 'User with this email already exists' });
+    }
+    
     const id = uuidv4();
 
     await dbRun(
-      'INSERT INTO users (id, email, name, role, department) VALUES (?, ?, ?, ?, ?)',
-      [id, email, name, role, department || null]
+      'INSERT INTO users (id, email, name, role, department, organization_id, email_verified) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      [id, email.toLowerCase(), name, role, department || null, req.organizationId, false]
     );
 
-    const user = await dbGet('SELECT * FROM users WHERE id = ?', [id]);
+    const user = await dbGet('SELECT id, email, name, role, department, avatar, created_at FROM users WHERE id = ?', [id]);
     res.status(201).json(user);
   } catch (error) {
     if (error.message.includes('UNIQUE constraint')) {
@@ -815,18 +1023,66 @@ app.post('/api/users', async (req, res) => {
   }
 });
 
-app.put('/api/users/:id', async (req, res) => {
+app.put('/api/users/:id', authenticate, requireOrganization, async (req, res) => {
   try {
-    const { email, name, role, department } = req.body;
+    const { id } = req.params;
+    const { email, name, role, department, avatar } = req.body;
+    
+    // Check user exists and is in same organization
+    const user = await dbGet(
+      'SELECT id, organization_id, role FROM users WHERE id = ?',
+      [id]
+    );
+    
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    if (user.organization_id !== req.organizationId) {
+      return res.status(403).json({ error: 'Cannot modify users from other organizations' });
+    }
+    
+    // Only admins can change roles
+    if (role !== undefined && role !== user.role) {
+      if (req.user.role !== 'Admin') {
+        return res.status(403).json({ error: 'Only admins can change user roles' });
+      }
+      
+      // Prevent removing last admin
+      if (role !== 'Admin' && user.role === 'Admin') {
+        const adminCount = await dbGet(
+          'SELECT COUNT(*) as count FROM users WHERE organization_id = ? AND role = ?',
+          [req.organizationId, 'Admin']
+        );
+        if (adminCount.count <= 1) {
+          return res.status(400).json({ error: 'Cannot remove last admin' });
+        }
+      }
+    }
+    
+    // Users can only update their own profile (except admins)
+    if (req.user.id !== id && req.user.role !== 'Admin') {
+      return res.status(403).json({ error: 'Can only update your own profile' });
+    }
+    
     const updates = [];
     const params = [];
-
-    if (email !== undefined) { updates.push('email = ?'); params.push(email); }
+    
+    if (email !== undefined) { 
+      // Check email not taken by another user
+      const emailUser = await dbGet('SELECT id FROM users WHERE email = ? AND id != ?', [email.toLowerCase(), id]);
+      if (emailUser) {
+        return res.status(400).json({ error: 'Email already in use' });
+      }
+      updates.push('email = ?'); 
+      params.push(email.toLowerCase()); 
+    }
     if (name !== undefined) { updates.push('name = ?'); params.push(name); }
-    if (role !== undefined) { updates.push('role = ?'); params.push(role); }
+    if (role !== undefined && req.user.role === 'Admin') { updates.push('role = ?'); params.push(role); }
     if (department !== undefined) { updates.push('department = ?'); params.push(department || null); }
+    if (avatar !== undefined) { updates.push('avatar = ?'); params.push(avatar); }
 
-    params.push(req.params.id);
+    params.push(id);
 
     if (updates.length === 0) {
       return res.status(400).json({ error: 'No fields to update' });
@@ -835,8 +1091,8 @@ app.put('/api/users/:id', async (req, res) => {
     const query = `UPDATE users SET ${updates.join(', ')} WHERE id = ?`;
     await dbRun(query, params);
 
-    const user = await dbGet('SELECT * FROM users WHERE id = ?', [req.params.id]);
-    res.json(user);
+    const updatedUser = await dbGet('SELECT id, email, name, role, department, avatar, created_at, last_login FROM users WHERE id = ?', [id]);
+    res.json(updatedUser);
   } catch (error) {
     if (error.message.includes('UNIQUE constraint')) {
       res.status(400).json({ error: 'Email already exists' });
@@ -846,7 +1102,7 @@ app.put('/api/users/:id', async (req, res) => {
   }
 });
 
-app.delete('/api/users/:id', async (req, res) => {
+app.delete('/api/users/:id', authenticate, authorize('Admin'), requireOrganization, async (req, res) => {
   try {
     await dbRun('DELETE FROM users WHERE id = ?', [req.params.id]);
     res.json({ message: 'User deleted successfully' });
@@ -1187,13 +1443,19 @@ app.get('/api/objectives/:id/comments', async (req, res) => {
 app.post('/api/objectives/:id/comments', async (req, res) => {
   try {
     const { user_id, content } = req.body;
+    const objectiveId = req.params.id;
     const id = uuidv4();
+    
+    // Get objective and commenter info for notifications
+    const objective = await dbGet('SELECT title, owner_id FROM objectives WHERE id = ?', [objectiveId]);
+    const { data: commenter } = await supabase.from('users').select('name').eq('id', user_id).single();
+    const commenterName = commenter?.name || 'Someone';
     
     const { data: comment, error: insertError } = await supabase
       .from('comments')
       .insert({
         id,
-        objective_id: req.params.id,
+        objective_id: objectiveId,
         user_id,
         content
       })
@@ -1218,6 +1480,37 @@ app.post('/api/objectives/:id/comments', async (req, res) => {
       user_email: commentWithUser.users?.email || ''
     };
     delete formattedComment.users; // Remove nested users object
+    
+    // Create notifications
+    if (objective) {
+      // Notify mentioned users
+      const mentions = await parseMentions(content);
+      if (mentions.length > 0) {
+        const mentionedUserIds = await getUserIdsFromMentions(mentions);
+        for (const mentionedUserId of mentionedUserIds) {
+          if (mentionedUserId !== user_id) {
+            await createNotification(
+              mentionedUserId,
+              'mention',
+              `You were mentioned in a comment`,
+              `${commenterName} mentioned you in a comment on "${objective.title}"`,
+              objectiveId,
+              id
+            );
+          }
+        }
+      }
+      
+      // Notify objective owner and contributors (excluding commenter)
+      await notifyObjectiveStakeholders(
+        objectiveId,
+        'comment',
+        `New comment on "${objective.title}"`,
+        `${commenterName} commented on "${objective.title}"`,
+        user_id,
+        id
+      );
+    }
     
     res.status(201).json(formattedComment);
   } catch (error) {
@@ -1304,6 +1597,853 @@ function applyFieldMapping(payload, fieldMapping) {
     return {};
   }
 }
+
+// Rate limiting for auth endpoints
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 5, // 5 requests per window
+  message: 'Too many authentication attempts, please try again later.',
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// Authentication endpoints
+// Register new user
+app.post('/api/auth/register', authLimiter, async (req, res) => {
+  try {
+    const { email, password, name, organizationName } = req.body;
+    
+    if (!email || !password || !name) {
+      return res.status(400).json({ error: 'Email, password, and name are required' });
+    }
+    
+    // Validate password
+    const passwordValidation = validatePassword(password);
+    if (!passwordValidation.valid) {
+      return res.status(400).json({ error: passwordValidation.errors.join(', ') });
+    }
+    
+    // Check if user already exists
+    const existingUser = await dbGet('SELECT id FROM users WHERE email = ?', [email.toLowerCase()]);
+    if (existingUser) {
+      return res.status(400).json({ error: 'User with this email already exists' });
+    }
+    
+    // Hash password
+    const passwordHash = await hashPassword(password);
+    
+    // Generate verification token
+    const verificationToken = generateRandomToken();
+    const userId = uuidv4();
+    
+    // Create organization if this is the first user
+    let organizationId;
+    const orgCount = await dbGet('SELECT COUNT(*) as count FROM organizations');
+    const isFirstUser = !orgCount || orgCount.count === 0;
+    
+    if (isFirstUser && organizationName) {
+      organizationId = uuidv4();
+      const orgSlug = organizationName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+      
+      await supabase
+        .from('organizations')
+        .insert({
+          id: organizationId,
+          name: organizationName,
+          slug: orgSlug
+        });
+    } else {
+      // For existing orgs, get the first one (or require org selection)
+      const firstOrg = await dbGet('SELECT id FROM organizations LIMIT 1');
+      if (!firstOrg) {
+        return res.status(400).json({ error: 'No organization found. Please contact an administrator.' });
+      }
+      organizationId = firstOrg.id;
+    }
+    
+    // Create user
+    const now = new Date().toISOString();
+    await supabase
+      .from('users')
+      .insert({
+        id: userId,
+        email: email.toLowerCase(),
+        name,
+        password_hash: passwordHash,
+        email_verified: false,
+        email_verification_token: verificationToken,
+        organization_id: organizationId,
+        role: isFirstUser ? 'Admin' : 'Team Member'
+      });
+    
+    // Send verification email
+    const baseUrl = process.env.FRONTEND_URL || `${req.protocol}://${req.get('host')}`;
+    await sendVerificationEmail(email, name, verificationToken, baseUrl);
+    
+    res.status(201).json({
+      message: 'Registration successful. Please check your email to verify your account.',
+      userId,
+      emailVerified: false
+    });
+  } catch (error) {
+    console.error('Registration error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Login
+app.post('/api/auth/login', authLimiter, async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password are required' });
+    }
+    
+    // Get user with password hash
+    const user = await dbGet(
+      'SELECT id, email, name, role, organization_id, password_hash, email_verified FROM users WHERE email = ?',
+      [email.toLowerCase()]
+    );
+    
+    if (!user) {
+      return res.status(401).json({ error: 'Invalid email or password' });
+    }
+    
+    if (!user.password_hash) {
+      return res.status(401).json({ error: 'Account not set up. Please use invitation link or reset password.' });
+    }
+    
+    // Verify password
+    const passwordValid = await comparePassword(password, user.password_hash);
+    if (!passwordValid) {
+      return res.status(401).json({ error: 'Invalid email or password' });
+    }
+    
+    if (!user.email_verified) {
+      return res.status(403).json({ 
+        error: 'Email not verified',
+        emailVerified: false,
+        userId: user.id
+      });
+    }
+    
+    // Update last login
+    await supabase
+      .from('users')
+      .update({ last_login: new Date().toISOString() })
+      .eq('id', user.id);
+    
+    // Generate token
+    const token = generateToken({
+      userId: user.id,
+      email: user.email,
+      role: user.role,
+      organizationId: user.organization_id
+    });
+    
+    res.json({
+      token,
+      user: {
+        id: user.id,
+        email: user.email,
+        name: user.name,
+        role: user.role,
+        organizationId: user.organization_id
+      }
+    });
+  } catch (error) {
+    console.error('Login error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Verify email
+app.post('/api/auth/verify-email', async (req, res) => {
+  try {
+    const { token } = req.body;
+    
+    if (!token) {
+      return res.status(400).json({ error: 'Verification token is required' });
+    }
+    
+    const user = await dbGet(
+      'SELECT id, email, name FROM users WHERE email_verification_token = ?',
+      [token]
+    );
+    
+    if (!user) {
+      return res.status(400).json({ error: 'Invalid or expired verification token' });
+    }
+    
+    // Verify email
+    await supabase
+      .from('users')
+      .update({
+        email_verified: true,
+        email_verification_token: null
+      })
+      .eq('id', user.id);
+    
+    res.json({ message: 'Email verified successfully' });
+  } catch (error) {
+    console.error('Email verification error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Resend verification email
+app.post('/api/auth/resend-verification', async (req, res) => {
+  try {
+    const { email } = req.body;
+    
+    if (!email) {
+      return res.status(400).json({ error: 'Email is required' });
+    }
+    
+    const user = await dbGet(
+      'SELECT id, email, name, email_verification_token, email_verified FROM users WHERE email = ?',
+      [email.toLowerCase()]
+    );
+    
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    if (user.email_verified) {
+      return res.status(400).json({ error: 'Email already verified' });
+    }
+    
+    // Generate new token if needed
+    let verificationToken = user.email_verification_token;
+    if (!verificationToken) {
+      verificationToken = generateRandomToken();
+      await supabase
+        .from('users')
+        .update({ email_verification_token: verificationToken })
+        .eq('id', user.id);
+    }
+    
+    // Send verification email
+    const baseUrl = process.env.FRONTEND_URL || `${req.protocol}://${req.get('host')}`;
+    await sendVerificationEmail(user.email, user.name, verificationToken, baseUrl);
+    
+    res.json({ message: 'Verification email sent' });
+  } catch (error) {
+    console.error('Resend verification error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Forgot password
+app.post('/api/auth/forgot-password', authLimiter, async (req, res) => {
+  try {
+    const { email } = req.body;
+    
+    if (!email) {
+      return res.status(400).json({ error: 'Email is required' });
+    }
+    
+    const user = await dbGet('SELECT id, email, name FROM users WHERE email = ?', [email.toLowerCase()]);
+    
+    // Don't reveal if user exists or not (security best practice)
+    if (user) {
+      const resetToken = generateRandomToken();
+      const expiresAt = new Date();
+      expiresAt.setHours(expiresAt.getHours() + 1); // 1 hour expiry
+      
+      // Store reset token (you might want a separate password_reset_tokens table)
+      // For now, we'll use email_verification_token field temporarily
+      await supabase
+        .from('users')
+        .update({ email_verification_token: resetToken })
+        .eq('id', user.id);
+      
+      const baseUrl = process.env.FRONTEND_URL || `${req.protocol}://${req.get('host')}`;
+      await sendPasswordResetEmail(user.email, user.name, resetToken, baseUrl);
+    }
+    
+    res.json({ message: 'If an account exists, a password reset email has been sent' });
+  } catch (error) {
+    console.error('Forgot password error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Reset password
+app.post('/api/auth/reset-password', authLimiter, async (req, res) => {
+  try {
+    const { token, password } = req.body;
+    
+    if (!token || !password) {
+      return res.status(400).json({ error: 'Token and password are required' });
+    }
+    
+    // Validate password
+    const passwordValidation = validatePassword(password);
+    if (!passwordValidation.valid) {
+      return res.status(400).json({ error: passwordValidation.errors.join(', ') });
+    }
+    
+    const user = await dbGet(
+      'SELECT id FROM users WHERE email_verification_token = ?',
+      [token]
+    );
+    
+    if (!user) {
+      return res.status(400).json({ error: 'Invalid or expired reset token' });
+    }
+    
+    // Hash new password
+    const passwordHash = await hashPassword(password);
+    
+    // Update password and clear token
+    await supabase
+      .from('users')
+      .update({
+        password_hash: passwordHash,
+        email_verification_token: null
+      })
+      .eq('id', user.id);
+    
+    res.json({ message: 'Password reset successfully' });
+  } catch (error) {
+    console.error('Reset password error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get current user
+app.get('/api/auth/me', authenticate, async (req, res) => {
+  try {
+    const user = await dbGet(
+      'SELECT id, email, name, role, organization_id, email_verified, created_at, last_login FROM users WHERE id = ?',
+      [req.user.id]
+    );
+    
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    res.json({
+      id: user.id,
+      email: user.email,
+      name: user.name,
+      role: user.role,
+      organizationId: user.organization_id,
+      emailVerified: user.email_verified,
+      createdAt: user.created_at,
+      lastLogin: user.last_login
+    });
+  } catch (error) {
+    console.error('Get current user error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Logout (client-side token removal, but can add token blacklisting here)
+app.post('/api/auth/logout', authenticate, async (req, res) => {
+  try {
+    // Optionally blacklist token in sessions table
+    // For now, just return success (client removes token)
+    res.json({ message: 'Logged out successfully' });
+  } catch (error) {
+    console.error('Logout error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Notifications endpoints
+app.get('/api/notifications', async (req, res) => {
+  try {
+    const userId = req.query.user_id;
+    if (!userId) {
+      return res.status(400).json({ error: 'user_id is required' });
+    }
+    
+    const limit = parseInt(req.query.limit) || 50;
+    const unreadOnly = req.query.unread_only === 'true';
+    
+    let query = supabase
+      .from('notifications')
+      .select('*, objectives(title)')
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false })
+      .limit(limit);
+    
+    if (unreadOnly) {
+      query = query.eq('read', false);
+    }
+    
+    const { data: notifications, error } = await query;
+    
+    if (error) throw error;
+    
+    // Format notifications
+    const formattedNotifications = (notifications || []).map(n => ({
+      ...n,
+      objective_title: n.objectives?.title || null,
+      objectives: undefined // Remove nested object
+    }));
+    
+    res.json(formattedNotifications);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/notifications/unread-count', async (req, res) => {
+  try {
+    const userId = req.query.user_id;
+    if (!userId) {
+      return res.status(400).json({ error: 'user_id is required' });
+    }
+    
+    const { count, error } = await supabase
+      .from('notifications')
+      .select('*', { count: 'exact', head: true })
+      .eq('user_id', userId)
+      .eq('read', false);
+    
+    if (error) throw error;
+    
+    res.json({ count: count || 0 });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.patch('/api/notifications/:id/read', async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    const { error } = await supabase
+      .from('notifications')
+      .update({ read: true })
+      .eq('id', id);
+    
+    if (error) throw error;
+    
+    res.json({ message: 'Notification marked as read' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.patch('/api/notifications/mark-all-read', async (req, res) => {
+  try {
+    const userId = req.body.user_id;
+    if (!userId) {
+      return res.status(400).json({ error: 'user_id is required' });
+    }
+    
+    const { error } = await supabase
+      .from('notifications')
+      .update({ read: true })
+      .eq('user_id', userId)
+      .eq('read', false);
+    
+    if (error) throw error;
+    
+    res.json({ message: 'All notifications marked as read' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Invitation endpoints
+// Create invitation (admin/manager only)
+app.post('/api/invitations', authenticate, requireAdminOrManager, requireOrganization, async (req, res) => {
+  try {
+    const { email, role } = req.body;
+    
+    if (!email) {
+      return res.status(400).json({ error: 'Email is required' });
+    }
+    
+    const inviteRole = role || 'Team Member';
+    const validRoles = ['Admin', 'Manager', 'Team Member', 'Viewer'];
+    if (!validRoles.includes(inviteRole)) {
+      return res.status(400).json({ error: 'Invalid role' });
+    }
+    
+    // Check if user already exists
+    const existingUser = await dbGet('SELECT id FROM users WHERE email = ?', [email.toLowerCase()]);
+    if (existingUser) {
+      return res.status(400).json({ error: 'User with this email already exists' });
+    }
+    
+    // Check if invitation already exists
+    const existingInvitation = await dbGet(
+      'SELECT id FROM invitations WHERE email = ? AND organization_id = ? AND status = ?',
+      [email.toLowerCase(), req.organizationId, 'pending']
+    );
+    if (existingInvitation) {
+      return res.status(400).json({ error: 'Invitation already sent to this email' });
+    }
+    
+    // Generate invitation token
+    const token = generateRandomToken();
+    const invitationId = uuidv4();
+    const expiresAt = new Date();
+    expiresAt.setDate(expiresAt.getDate() + 7); // 7 days expiry
+    
+    // Create invitation
+    await supabase
+      .from('invitations')
+      .insert({
+        id: invitationId,
+        email: email.toLowerCase(),
+        token,
+        organization_id: req.organizationId,
+        invited_by: req.user.id,
+        role: inviteRole,
+        status: 'pending',
+        expires_at: expiresAt.toISOString()
+      });
+    
+    // Get organization and inviter info
+    const organization = await dbGet('SELECT name FROM organizations WHERE id = ?', [req.organizationId]);
+    const inviter = await dbGet('SELECT name FROM users WHERE id = ?', [req.user.id]);
+    
+    // Send invitation email
+    const baseUrl = process.env.FRONTEND_URL || `${req.protocol}://${req.get('host')}`;
+    await sendInvitationEmail(
+      email,
+      inviter.name,
+      organization.name,
+      inviteRole,
+      token,
+      baseUrl
+    );
+    
+    const invitation = await dbGet('SELECT * FROM invitations WHERE id = ?', [invitationId]);
+    res.status(201).json({
+      ...invitation,
+      expires_at: invitation.expires_at
+    });
+  } catch (error) {
+    console.error('Create invitation error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get invitation by token
+app.get('/api/invitations/:token', async (req, res) => {
+  try {
+    const { token } = req.params;
+    
+    const invitation = await dbGet(
+      `SELECT i.*, o.name as organization_name, u.name as inviter_name 
+       FROM invitations i
+       JOIN organizations o ON i.organization_id = o.id
+       JOIN users u ON i.invited_by = u.id
+       WHERE i.token = ?`,
+      [token]
+    );
+    
+    if (!invitation) {
+      return res.status(404).json({ error: 'Invitation not found' });
+    }
+    
+    // Check if expired
+    if (new Date(invitation.expires_at) < new Date()) {
+      await supabase
+        .from('invitations')
+        .update({ status: 'expired' })
+        .eq('id', invitation.id);
+      return res.status(400).json({ error: 'Invitation has expired' });
+    }
+    
+    // Check if already accepted
+    if (invitation.status !== 'pending') {
+      return res.status(400).json({ error: `Invitation has been ${invitation.status}` });
+    }
+    
+    res.json({
+      id: invitation.id,
+      email: invitation.email,
+      organizationName: invitation.organization_name,
+      inviterName: invitation.inviter_name,
+      role: invitation.role,
+      expiresAt: invitation.expires_at
+    });
+  } catch (error) {
+    console.error('Get invitation error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Accept invitation
+app.post('/api/invitations/:token/accept', async (req, res) => {
+  try {
+    const { token } = req.params;
+    const { password, name } = req.body;
+    
+    if (!password || !name) {
+      return res.status(400).json({ error: 'Password and name are required' });
+    }
+    
+    // Validate password
+    const passwordValidation = validatePassword(password);
+    if (!passwordValidation.valid) {
+      return res.status(400).json({ error: passwordValidation.errors.join(', ') });
+    }
+    
+    // Get invitation
+    const invitation = await dbGet(
+      'SELECT * FROM invitations WHERE token = ?',
+      [token]
+    );
+    
+    if (!invitation) {
+      return res.status(404).json({ error: 'Invitation not found' });
+    }
+    
+    // Check if expired
+    if (new Date(invitation.expires_at) < new Date()) {
+      await supabase
+        .from('invitations')
+        .update({ status: 'expired' })
+        .eq('id', invitation.id);
+      return res.status(400).json({ error: 'Invitation has expired' });
+    }
+    
+    // Check if already accepted
+    if (invitation.status !== 'pending') {
+      return res.status(400).json({ error: `Invitation has been ${invitation.status}` });
+    }
+    
+    // Check if user already exists
+    const existingUser = await dbGet('SELECT id FROM users WHERE email = ?', [invitation.email]);
+    if (existingUser) {
+      return res.status(400).json({ error: 'User with this email already exists' });
+    }
+    
+    // Hash password
+    const passwordHash = await hashPassword(password);
+    const userId = uuidv4();
+    
+    // Create user
+    const now = new Date().toISOString();
+    await supabase
+      .from('users')
+      .insert({
+        id: userId,
+        email: invitation.email,
+        name,
+        password_hash: passwordHash,
+        email_verified: true, // Invited users are pre-verified
+        organization_id: invitation.organization_id,
+        invited_by: invitation.invited_by,
+        invited_at: now,
+        role: invitation.role
+      });
+    
+    // Mark invitation as accepted
+    await supabase
+      .from('invitations')
+      .update({
+        status: 'accepted',
+        accepted_at: now
+      })
+      .eq('id', invitation.id);
+    
+    // Generate token
+    const jwtToken = generateToken({
+      userId,
+      email: invitation.email,
+      role: invitation.role,
+      organizationId: invitation.organization_id
+    });
+    
+    res.status(201).json({
+      token: jwtToken,
+      user: {
+        id: userId,
+        email: invitation.email,
+        name,
+        role: invitation.role,
+        organizationId: invitation.organization_id
+      }
+    });
+  } catch (error) {
+    console.error('Accept invitation error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// List invitations (admin/manager only)
+app.get('/api/invitations', authenticate, requireAdminOrManager, requireOrganization, async (req, res) => {
+  try {
+    const invitations = await dbAll(
+      `SELECT i.*, u.name as inviter_name 
+       FROM invitations i
+       JOIN users u ON i.invited_by = u.id
+       WHERE i.organization_id = ?
+       ORDER BY i.created_at DESC`,
+      [req.organizationId]
+    );
+    
+    res.json(invitations);
+  } catch (error) {
+    console.error('List invitations error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Cancel invitation
+app.delete('/api/invitations/:id', authenticate, requireAdminOrManager, requireOrganization, async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    const invitation = await dbGet(
+      'SELECT * FROM invitations WHERE id = ? AND organization_id = ?',
+      [id, req.organizationId]
+    );
+    
+    if (!invitation) {
+      return res.status(404).json({ error: 'Invitation not found' });
+    }
+    
+    if (invitation.status === 'accepted') {
+      return res.status(400).json({ error: 'Cannot cancel accepted invitation' });
+    }
+    
+    await supabase
+      .from('invitations')
+      .update({ status: 'cancelled' })
+      .eq('id', id);
+    
+    res.json({ message: 'Invitation cancelled' });
+  } catch (error) {
+    console.error('Cancel invitation error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Organization endpoints
+// Get user's organization
+app.get('/api/organizations', authenticate, requireOrganization, async (req, res) => {
+  try {
+    const organization = await dbGet(
+      'SELECT * FROM organizations WHERE id = ?',
+      [req.organizationId]
+    );
+    
+    if (!organization) {
+      return res.status(404).json({ error: 'Organization not found' });
+    }
+    
+    res.json(organization);
+  } catch (error) {
+    console.error('Get organization error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Create organization (first user only, or admin)
+app.post('/api/organizations', authenticate, async (req, res) => {
+  try {
+    const { name } = req.body;
+    
+    if (!name) {
+      return res.status(400).json({ error: 'Organization name is required' });
+    }
+    
+    // Check if user already has an organization
+    if (req.user.organizationId) {
+      return res.status(400).json({ error: 'User already belongs to an organization' });
+    }
+    
+    const orgId = uuidv4();
+    const orgSlug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+    
+    // Check if slug is unique
+    const existingOrg = await dbGet('SELECT id FROM organizations WHERE slug = ?', [orgSlug]);
+    if (existingOrg) {
+      return res.status(400).json({ error: 'Organization with this name already exists' });
+    }
+    
+    // Create organization
+    await supabase
+      .from('organizations')
+      .insert({
+        id: orgId,
+        name,
+        slug: orgSlug
+      });
+    
+    // Update user's organization and make them admin
+    await supabase
+      .from('users')
+      .update({
+        organization_id: orgId,
+        role: 'Admin'
+      })
+      .eq('id', req.user.id);
+    
+    const organization = await dbGet('SELECT * FROM organizations WHERE id = ?', [orgId]);
+    res.status(201).json(organization);
+  } catch (error) {
+    console.error('Create organization error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Update organization (admin only)
+app.put('/api/organizations/:id', authenticate, authorize('Admin'), requireOrganization, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name } = req.body;
+    
+    if (id !== req.organizationId) {
+      return res.status(403).json({ error: 'Cannot update other organizations' });
+    }
+    
+    if (!name) {
+      return res.status(400).json({ error: 'Organization name is required' });
+    }
+    
+    const orgSlug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+    
+    // Check if slug is unique (excluding current org)
+    const existingOrg = await dbGet('SELECT id FROM organizations WHERE slug = ? AND id != ?', [orgSlug, id]);
+    if (existingOrg) {
+      return res.status(400).json({ error: 'Organization with this name already exists' });
+    }
+    
+    await supabase
+      .from('organizations')
+      .update({
+        name,
+        slug: orgSlug,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', id);
+    
+    const organization = await dbGet('SELECT * FROM organizations WHERE id = ?', [id]);
+    res.json(organization);
+  } catch (error) {
+    console.error('Update organization error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get organization members
+app.get('/api/organizations/members', authenticate, requireOrganization, async (req, res) => {
+  try {
+    const members = await dbAll(
+      'SELECT id, email, name, role, created_at, last_login FROM users WHERE organization_id = ? ORDER BY created_at DESC',
+      [req.organizationId]
+    );
+    
+    res.json(members);
+  } catch (error) {
+    console.error('Get organization members error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
 
 // Webhook Receiver Endpoint
 app.post('/api/webhooks/:webhook_id', async (req, res) => {
