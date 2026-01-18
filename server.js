@@ -2239,6 +2239,60 @@ app.get('/api/objectives/:id/subscribe', authenticate, requireOrganization, asyn
   }
 });
 
+// Unsubscribe from all objectives
+app.delete('/api/objectives/subscribe/all', authenticate, requireOrganization, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    
+    // Delete all subscriptions for this user
+    const { error } = await supabase
+      .from('objective_subscriptions')
+      .delete()
+      .eq('user_id', userId);
+    
+    if (error) {
+      throw error;
+    }
+    
+    res.json({ message: 'Unsubscribed from all objectives', count: 'all' });
+  } catch (error) {
+    console.error('Unsubscribe all error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get subscription count for debugging
+app.get('/api/objectives/subscriptions/count', authenticate, requireOrganization, async (req, res) => {
+  try {
+    const userId = req.query.user_id || req.user.id;
+    
+    // Get subscription count for this user
+    const { count, error } = await supabase
+      .from('objective_subscriptions')
+      .select('*', { count: 'exact', head: true })
+      .eq('user_id', userId);
+    
+    if (error) {
+      throw error;
+    }
+    
+    // Also get total objectives count for context
+    const totalObjectives = await dbGet(
+      'SELECT COUNT(*) as count FROM objectives WHERE organization_id = ?',
+      [req.organizationId]
+    );
+    
+    res.json({ 
+      subscription_count: count || 0,
+      total_objectives: totalObjectives?.count || 0,
+      user_id: userId
+    });
+  } catch (error) {
+    console.error('Subscription count error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Get objectives that the current user is subscribed to
 app.get('/api/objectives/subscribed', authenticate, requireOrganization, async (req, res) => {
   try {
