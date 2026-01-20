@@ -2998,14 +2998,16 @@ app.post('/api/webhooks/:webhook_id', async (req, res) => {
     // Apply updates if any
     if (Object.keys(updates).length > 0) {
       updates.updated_at = new Date().toISOString();
-      const updateFields = Object.keys(updates).map(key => `${key} = ?`).join(', ');
-      const updateValues = Object.values(updates);
-      updateValues.push(webhookIntegration.objective_id);
       
-      await dbRun(
-        `UPDATE objectives SET ${updateFields} WHERE id = ?`,
-        updateValues
-      );
+      // Use Supabase client directly for UPDATE to avoid parsing issues
+      const { error: updateError } = await supabase
+        .from('objectives')
+        .update(updates)
+        .eq('id', webhookIntegration.objective_id);
+      
+      if (updateError) {
+        throw updateError;
+      }
       
       // Create progress update record
       await dbRun(
@@ -3091,6 +3093,8 @@ app.post('/api/webhooks/:webhook_id', async (req, res) => {
     });
   } catch (error) {
     console.error('Webhook processing error:', error);
+    console.error('Error stack:', error.stack);
+    console.error('Webhook ID:', req.params.webhook_id);
     
     // Log error
     const webhookId = req.params.webhook_id;
@@ -3160,20 +3164,29 @@ app.post('/api/webhooks', async (req, res) => {
 // Get all webhooks for an integration
 app.get('/api/integrations/:integration_id/webhooks', async (req, res) => {
   try {
-    // Also match webhooks with null integration_id (for localStorage integrations)
-    const webhooks = await dbAll(
-      `SELECT w.*, o.title as objective_title 
-       FROM webhook_integrations w
-       JOIN objectives o ON w.objective_id = o.id
-       WHERE w.integration_id = ? OR w.integration_id IS NULL`,
-      [req.params.integration_id]
-    );
+    // Use Supabase client directly for JOIN query
+    const { data: webhooks, error } = await supabase
+      .from('webhook_integrations')
+      .select(`
+        *,
+        objectives!webhook_integrations_objective_id_fkey (
+          title
+        )
+      `)
+      .or(`integration_id.eq.${req.params.integration_id},integration_id.is.null`)
+      .order('created_at', { ascending: false });
     
-    const baseUrl = `${req.protocol}://${req.get('host')}`;
-    const webhooksWithUrl = webhooks.map(w => ({
+    if (error) {
+      throw error;
+    }
+    
+    // Use BASE_URL env var if set (for production), otherwise construct from request
+    const baseUrl = process.env.BASE_URL || `${req.protocol}://${req.get('host')}`;
+    const webhooksWithUrl = (webhooks || []).map(w => ({
       ...w,
+      objective_title: w.objectives?.title || null,
       webhook_url: `${baseUrl}/api/webhooks/${w.id}`,
-      field_mapping: w.field_mapping ? JSON.parse(w.field_mapping) : {}
+      field_mapping: w.field_mapping ? (typeof w.field_mapping === 'string' ? JSON.parse(w.field_mapping) : w.field_mapping) : {}
     }));
     
     res.json(webhooksWithUrl);
@@ -3185,19 +3198,28 @@ app.get('/api/integrations/:integration_id/webhooks', async (req, res) => {
 // Get all webhooks (for debugging/listing all)
 app.get('/api/webhooks', async (req, res) => {
   try {
-    const webhooks = await dbAll(
-      `SELECT w.*, o.title as objective_title 
-       FROM webhook_integrations w
-       JOIN objectives o ON w.objective_id = o.id
-       ORDER BY w.created_at DESC`
-    );
+    // Use Supabase client directly for JOIN query
+    const { data: webhooks, error } = await supabase
+      .from('webhook_integrations')
+      .select(`
+        *,
+        objectives!webhook_integrations_objective_id_fkey (
+          title
+        )
+      `)
+      .order('created_at', { ascending: false });
+    
+    if (error) {
+      throw error;
+    }
     
     // Use BASE_URL env var if set (for production), otherwise construct from request
     const baseUrl = process.env.BASE_URL || `${req.protocol}://${req.get('host')}`;
-    const webhooksWithUrl = webhooks.map(w => ({
+    const webhooksWithUrl = (webhooks || []).map(w => ({
       ...w,
+      objective_title: w.objectives?.title || null,
       webhook_url: `${baseUrl}/api/webhooks/${w.id}`,
-      field_mapping: w.field_mapping ? JSON.parse(w.field_mapping) : {}
+      field_mapping: w.field_mapping ? (typeof w.field_mapping === 'string' ? JSON.parse(w.field_mapping) : w.field_mapping) : {}
     }));
     
     res.json(webhooksWithUrl);
@@ -3209,13 +3231,24 @@ app.get('/api/webhooks', async (req, res) => {
 // Get webhook details
 app.get('/api/webhooks/:id', async (req, res) => {
   try {
-    const webhook = await dbGet(
-      `SELECT w.*, o.title as objective_title 
-       FROM webhook_integrations w
-       JOIN objectives o ON w.objective_id = o.id
-       WHERE w.id = ?`,
-      [req.params.id]
-    );
+    // Use Supabase client directly for JOIN query
+    const { data: webhook, error } = await supabase
+      .from('webhook_integrations')
+      .select(`
+        *,
+        objectives!webhook_integrations_objective_id_fkey (
+          title
+        )
+      `)
+      .eq('id', req.params.id)
+      .single();
+    
+    if (error) {
+      if (error.code === 'PGRST116') {
+        return res.status(404).json({ error: 'Webhook not found' });
+      }
+      throw error;
+    }
     
     if (!webhook) {
       return res.status(404).json({ error: 'Webhook not found' });
@@ -3225,8 +3258,9 @@ app.get('/api/webhooks/:id', async (req, res) => {
     const baseUrl = process.env.BASE_URL || `${req.protocol}://${req.get('host')}`;
     res.json({
       ...webhook,
+      objective_title: webhook.objectives?.title || null,
       webhook_url: `${baseUrl}/api/webhooks/${webhook.id}`,
-      field_mapping: webhook.field_mapping ? JSON.parse(webhook.field_mapping) : {}
+      field_mapping: webhook.field_mapping ? (typeof webhook.field_mapping === 'string' ? JSON.parse(webhook.field_mapping) : webhook.field_mapping) : {}
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
