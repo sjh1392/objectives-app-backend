@@ -137,6 +137,9 @@ async function notifyObjectiveStakeholders(objectiveId, type, title, message, ex
 }
 
 const app = express();
+
+// Trust proxy for accurate protocol/host detection (needed for production behind load balancers)
+app.set('trust proxy', true);
 const PORT = process.env.PORT || 3001;
 
 const __filename = fileURLToPath(import.meta.url);
@@ -3143,9 +3146,11 @@ app.post('/api/webhooks', async (req, res) => {
     );
     
     const webhook = await dbGet('SELECT * FROM webhook_integrations WHERE id = ?', [id]);
+    // Use BASE_URL env var if set (for production), otherwise construct from request
+    const baseUrl = process.env.BASE_URL || `${req.protocol}://${req.get('host')}`;
     res.status(201).json({
       ...webhook,
-      webhook_url: `${req.protocol}://${req.get('host')}/api/webhooks/${id}`
+      webhook_url: `${baseUrl}/api/webhooks/${id}`
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -3187,7 +3192,8 @@ app.get('/api/webhooks', async (req, res) => {
        ORDER BY w.created_at DESC`
     );
     
-    const baseUrl = `${req.protocol}://${req.get('host')}`;
+    // Use BASE_URL env var if set (for production), otherwise construct from request
+    const baseUrl = process.env.BASE_URL || `${req.protocol}://${req.get('host')}`;
     const webhooksWithUrl = webhooks.map(w => ({
       ...w,
       webhook_url: `${baseUrl}/api/webhooks/${w.id}`,
@@ -3215,7 +3221,8 @@ app.get('/api/webhooks/:id', async (req, res) => {
       return res.status(404).json({ error: 'Webhook not found' });
     }
     
-    const baseUrl = `${req.protocol}://${req.get('host')}`;
+    // Use BASE_URL env var if set (for production), otherwise construct from request
+    const baseUrl = process.env.BASE_URL || `${req.protocol}://${req.get('host')}`;
     res.json({
       ...webhook,
       webhook_url: `${baseUrl}/api/webhooks/${webhook.id}`,
@@ -3264,7 +3271,8 @@ app.put('/api/webhooks/:id', async (req, res) => {
     );
     
     const webhook = await dbGet('SELECT * FROM webhook_integrations WHERE id = ?', [req.params.id]);
-    const baseUrl = `${req.protocol}://${req.get('host')}`;
+    // Use BASE_URL env var if set (for production), otherwise construct from request
+    const baseUrl = process.env.BASE_URL || `${req.protocol}://${req.get('host')}`;
     res.json({
       ...webhook,
       webhook_url: `${baseUrl}/api/webhooks/${webhook.id}`,
