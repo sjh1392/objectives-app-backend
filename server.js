@@ -2974,6 +2974,13 @@ app.post('/api/webhooks/:webhook_id', async (req, res) => {
     
     if (mappedData.progress_percentage !== undefined) {
       updates.progress_percentage = Math.max(0, Math.min(100, mappedData.progress_percentage));
+      
+      // If only progress_percentage is provided, calculate current_value from it
+      if (mappedData.current_value === undefined && objective.target_value > 0) {
+        const calculatedCurrent = (updates.progress_percentage / 100) * objective.target_value;
+        valueAfter = calculatedCurrent;
+        updates.current_value = calculatedCurrent;
+      }
     }
     
     if (mappedData.current_value !== undefined) {
@@ -3010,18 +3017,27 @@ app.post('/api/webhooks/:webhook_id', async (req, res) => {
       }
       
       // Create progress update record
-      await dbRun(
-        `INSERT INTO progress_updates (id, objective_id, user_id, previous_value, new_value, notes)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-        [
-          uuidv4(),
-          webhookIntegration.objective_id,
-          null, // System update
-          valueBefore,
-          valueAfter,
-          'Updated via webhook'
-        ]
-      );
+      try {
+        const progressUpdateId = uuidv4();
+        const { error: progressError } = await supabase
+          .from('progress_updates')
+          .insert({
+            id: progressUpdateId,
+            objective_id: webhookIntegration.objective_id,
+            user_id: null, // System update
+            previous_value: valueBefore,
+            new_value: valueAfter,
+            notes: 'Updated via webhook'
+          });
+        
+        if (progressError) {
+          console.error('Error creating progress update:', progressError);
+          // Don't fail the whole webhook if progress update fails
+        }
+      } catch (progressErr) {
+        console.error('Error creating progress update:', progressErr);
+        // Don't fail the whole webhook if progress update fails
+      }
       
       // Create a comment in the activity feed
       // Build a detailed message showing all changed values
@@ -3055,15 +3071,25 @@ app.post('/api/webhooks/:webhook_id', async (req, res) => {
         }
       }
       
-      await dbRun(
-        `INSERT INTO comments (id, objective_id, user_id, content) VALUES (?, ?, ?, ?)`,
-        [
-          uuidv4(),
-          webhookIntegration.objective_id,
-          null, // System update (no user) - user_id is nullable
-          commentContent
-        ]
-      );
+      try {
+        const commentId = uuidv4();
+        const { error: commentError } = await supabase
+          .from('comments')
+          .insert({
+            id: commentId,
+            objective_id: webhookIntegration.objective_id,
+            user_id: null, // System update (no user) - user_id is nullable
+            content: commentContent
+          });
+        
+        if (commentError) {
+          console.error('Error creating comment:', commentError);
+          // Don't fail the whole webhook if comment creation fails
+        }
+      } catch (commentErr) {
+        console.error('Error creating comment:', commentErr);
+        // Don't fail the whole webhook if comment creation fails
+      }
       
       // Recalculate parent objective progress if applicable
       if (objective.parent_objective_id) {
@@ -3072,18 +3098,39 @@ app.post('/api/webhooks/:webhook_id', async (req, res) => {
     }
     
     // Mark event as processed
-    await dbRun(
-      `UPDATE webhook_events 
-       SET processed = 1, value_before = ?, value_after = ? 
-       WHERE id = ?`,
-      [valueBefore, valueAfter, eventId]
-    );
+    try {
+      const { error: eventError } = await supabase
+        .from('webhook_events')
+        .update({
+          processed: true,
+          value_before: valueBefore,
+          value_after: valueAfter
+        })
+        .eq('id', eventId);
+      
+      if (eventError) {
+        console.error('Error updating webhook event:', eventError);
+      }
+    } catch (eventErr) {
+      console.error('Error updating webhook event:', eventErr);
+    }
     
     // Update webhook integration last_received_at
-    await dbRun(
-      'UPDATE webhook_integrations SET last_received_at = CURRENT_TIMESTAMP, failure_count = 0 WHERE id = ?',
-      [webhookId]
-    );
+    try {
+      const { error: integrationError } = await supabase
+        .from('webhook_integrations')
+        .update({
+          last_received_at: new Date().toISOString(),
+          failure_count: 0
+        })
+        .eq('id', webhookId);
+      
+      if (integrationError) {
+        console.error('Error updating webhook integration:', integrationError);
+      }
+    } catch (integrationErr) {
+      console.error('Error updating webhook integration:', integrationErr);
+    }
     
     res.json({ 
       success: true, 
