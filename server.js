@@ -1237,12 +1237,82 @@ app.post('/api/users', authenticate, requireAdminOrManager, requireOrganization,
       return res.status(400).json({ error: 'User with this email already exists' });
     }
     
+    // Check if invitation already exists
+    const existingInvitation = await dbGet(
+      'SELECT id FROM invitations WHERE email = ? AND organization_id = ? AND status = ?',
+      [email.toLowerCase(), req.organizationId, 'pending']
+    );
+    if (existingInvitation) {
+      return res.status(400).json({ error: 'Invitation already sent to this email' });
+    }
+    
     const id = uuidv4();
 
+    // Create user without password (they'll set it via invitation)
     await dbRun(
       'INSERT INTO users (id, email, name, role, department, organization_id, email_verified) VALUES (?, ?, ?, ?, ?, ?, ?)',
       [id, email.toLowerCase(), name, role, department || null, req.organizationId, false]
     );
+
+    // Create and send invitation for the new user
+    const token = generateRandomToken();
+    const invitationId = uuidv4();
+    const expiresAt = new Date();
+    expiresAt.setDate(expiresAt.getDate() + 7); // 7 days expiry
+    
+    // Get organization and inviter info for email (before creating invitation)
+    const organization = await dbGet('SELECT name FROM organizations WHERE id = ?', [req.organizationId]);
+    const inviter = await dbGet('SELECT name FROM users WHERE id = ?', [req.user.id]);
+    
+    // Create invitation
+    const { error: invitationError } = await supabase
+      .from('invitations')
+      .insert({
+        id: invitationId,
+        email: email.toLowerCase(),
+        token,
+        organization_id: req.organizationId,
+        invited_by: req.user.id,
+        role: role,
+        status: 'pending',
+        expires_at: expiresAt.toISOString()
+      });
+    
+    if (invitationError) {
+      console.error('Error creating invitation:', invitationError);
+      // Rollback user creation if invitation fails
+      await dbRun('DELETE FROM users WHERE id = ?', [id]);
+      return res.status(500).json({ error: 'Failed to create invitation: ' + invitationError.message });
+    }
+    
+    // Send invitation email
+    const baseUrl = process.env.FRONTEND_URL || `${req.protocol}://${req.get('host')}`;
+    try {
+      await sendInvitationEmail(
+        email,
+        inviter.name,
+        organization.name,
+        role,
+        token,
+        baseUrl
+      );
+      
+      // Create in-app notification for inviter
+      await createNotification(
+        req.user.id,
+        'invitation_sent',
+        'Invitation Sent',
+        `You've invited ${email} to join ${organization.name} as ${role}`,
+        null, // objective_id
+        null, // comment_id
+        null, // progress_update_id
+        invitationId // invitation_id
+      );
+    } catch (emailError) {
+      console.error('Error sending invitation email:', emailError);
+      // Don't fail the request if email fails, but log it
+      // User and invitation are already created, so we continue
+    }
 
     const user = await dbGet('SELECT id, email, name, role, department, avatar, created_at FROM users WHERE id = ?', [id]);
     res.status(201).json(user);
@@ -3277,31 +3347,56 @@ app.post('/api/invitations/:token/accept', async (req, res) => {
       return res.status(400).json({ error: `Invitation has been ${invitation.status}` });
     }
     
-    // Check if user already exists
-    const existingUser = await dbGet('SELECT id FROM users WHERE email = ?', [invitation.email]);
-    if (existingUser) {
-      return res.status(400).json({ error: 'User with this email already exists' });
-    }
+    // Check if user already exists (may have been created via POST /api/users)
+    const existingUser = await dbGet('SELECT id, organization_id, role FROM users WHERE email = ?', [invitation.email]);
     
-    // Hash password
-    const passwordHash = await hashPassword(password);
-    const userId = uuidv4();
-    
-    // Create user
+    let userId;
     const now = new Date().toISOString();
-    await supabase
-      .from('users')
-      .insert({
-        id: userId,
-        email: invitation.email,
-        name,
-        password_hash: passwordHash,
-        email_verified: true, // Invited users are pre-verified
-        organization_id: invitation.organization_id,
-        invited_by: invitation.invited_by,
-        invited_at: now,
-        role: invitation.role
-      });
+    
+    if (existingUser) {
+      // User already exists (created via "Add Person" flow)
+      // Verify they're in the same organization
+      if (existingUser.organization_id !== invitation.organization_id) {
+        return res.status(400).json({ error: 'User exists but belongs to a different organization' });
+      }
+      
+      userId = existingUser.id;
+      
+      // Hash password and update user
+      const passwordHash = await hashPassword(password);
+      await dbRun(
+        'UPDATE users SET password_hash = ?, email_verified = ?, invited_by = ?, invited_at = ? WHERE id = ?',
+        [passwordHash, true, invitation.invited_by, now, userId]
+      );
+      
+      // Update name if provided and different
+      if (name && name !== existingUser.name) {
+        await dbRun('UPDATE users SET name = ? WHERE id = ?', [name, userId]);
+      }
+      
+      // Update role if invitation has a different role (invitation role takes precedence)
+      if (invitation.role && invitation.role !== existingUser.role) {
+        await dbRun('UPDATE users SET role = ? WHERE id = ?', [invitation.role, userId]);
+      }
+    } else {
+      // User doesn't exist, create new user
+      const passwordHash = await hashPassword(password);
+      userId = uuidv4();
+      
+      await supabase
+        .from('users')
+        .insert({
+          id: userId,
+          email: invitation.email,
+          name,
+          password_hash: passwordHash,
+          email_verified: true, // Invited users are pre-verified
+          organization_id: invitation.organization_id,
+          invited_by: invitation.invited_by,
+          invited_at: now,
+          role: invitation.role
+        });
+    }
     
     // Mark invitation as accepted
     await supabase
