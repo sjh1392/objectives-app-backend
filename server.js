@@ -7,13 +7,14 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
 import rateLimit from 'express-rate-limit';
+import { OAuth2Client } from 'google-auth-library';
 import supabase from './db.js';
 import { dbRun, dbGet, dbAll } from './db-helpers.js';
 import { hashPassword, comparePassword, validatePassword } from './utils/password.js';
 import { generateToken, generateRandomToken, hashToken } from './utils/jwt.js';
-import { sendVerificationEmail, sendInvitationEmail, sendPasswordResetEmail } from './utils/email.js';
+import { sendVerificationEmail, sendInvitationEmail, sendPasswordResetEmail, sendInvitationAcceptedEmail } from './utils/email.js';
 import { authenticate, optionalAuthenticate, authorize, requireOrganization, requireAdminOrManager } from './middleware/auth.js';
-import { uploadFile, deleteFile, getPublicUrl, initializeStorage } from './utils/storage.js';
+import { uploadFile, deleteFile, getPublicUrl, initializeStorage, MEDIA_BUCKET_NAME } from './utils/storage.js';
 
 // Notification helper functions
 async function parseMentions(content) {
@@ -54,7 +55,7 @@ async function getUserIdsFromMentions(mentions) {
   return [...new Set(userIds)]; // Remove duplicates
 }
 
-async function createNotification(userId, type, title, message, objectiveId = null, commentId = null, progressUpdateId = null) {
+async function createNotification(userId, type, title, message, objectiveId = null, commentId = null, progressUpdateId = null, invitationId = null) {
   try {
     const id = uuidv4();
     const { error } = await supabase
@@ -65,6 +66,7 @@ async function createNotification(userId, type, title, message, objectiveId = nu
         objective_id: objectiveId,
         comment_id: commentId,
         progress_update_id: progressUpdateId,
+        invitation_id: invitationId,
         type,
         title,
         message,
@@ -209,6 +211,29 @@ const upload = multer({
   }
 });
 
+// Multer config for media files (audio/video)
+const mediaStorage = multer.memoryStorage(); // Store in memory for Supabase upload
+const mediaUpload = multer({
+  storage: mediaStorage,
+  limits: { fileSize: 50 * 1024 * 1024 }, // 50MB limit for audio/video
+  fileFilter: (req, file, cb) => {
+    // Check mimetype first (more reliable)
+    const mimetype = /audio|video/.test(file.mimetype);
+    
+    // Also check extension as fallback
+    const extname = path.extname(file.originalname || '').toLowerCase();
+    const allowedExtensions = ['.webm', '.mp3', '.mp4', '.wav', '.ogg', '.m4a', '.aac'];
+    const hasAllowedExtension = allowedExtensions.includes(extname);
+    
+    // Accept if mimetype is audio/video OR if extension is allowed (for cases where mimetype might not be set)
+    if (mimetype || hasAllowedExtension) {
+      return cb(null, true);
+    } else {
+      cb(new Error(`Only audio/video files are allowed! Received: ${file.mimetype || 'unknown'} ${extname || 'no extension'}`));
+    }
+  }
+});
+
 // Serve static files from public directory
 app.use('/uploads', express.static(path.join(__dirname, 'public', 'uploads')));
 
@@ -303,6 +328,9 @@ app.get('/api/objectives', optionalAuthenticate, async (req, res) => {
     // Filter by organization if user is authenticated
     if (req.user && req.user.organizationId) {
       queryBuilder = queryBuilder.eq('organization_id', req.user.organizationId);
+    } else if (req.user && !req.user.organizationId) {
+      // User is authenticated but has no organization - return empty array
+      return res.json([]);
     }
 
     // Apply filters
@@ -893,12 +921,142 @@ app.get('/api/tags/:tag/stats', async (req, res) => {
   }
 });
 
-// Dashboard stats
-app.get('/api/dashboard/stats', async (req, res) => {
+// Update comment
+app.put('/api/comments/:id', async (req, res) => {
   try {
-    const allObjectives = await dbAll('SELECT * FROM objectives');
+    const { id } = req.params;
+    const { content, user_id } = req.body;
+    
+    // Verify comment exists and user owns it
+    const { data: existingComment, error: fetchError } = await supabase
+      .from('comments')
+      .select('user_id')
+      .eq('id', id)
+      .single();
+    
+    if (fetchError) throw fetchError;
+    if (!existingComment) {
+      return res.status(404).json({ error: 'Comment not found' });
+    }
+    
+    if (existingComment.user_id !== user_id) {
+      return res.status(403).json({ error: 'You can only edit your own comments' });
+    }
+    
+    // Update comment
+    const { data: updatedComment, error: updateError } = await supabase
+      .from('comments')
+      .update({
+        content,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', id)
+      .select()
+      .single();
+    
+    if (updateError) throw updateError;
+    
+    // Fetch with user details
+    const { data: commentWithUser, error: userError } = await supabase
+      .from('comments')
+      .select('*, users(name, email)')
+      .eq('id', id)
+      .single();
+    
+    if (userError) throw userError;
+    
+    // Format response
+    const formattedComment = {
+      ...commentWithUser,
+      user_name: commentWithUser.users?.name || 'System',
+      user_email: commentWithUser.users?.email || ''
+    };
+    delete formattedComment.users;
+    
+    res.json(formattedComment);
+  } catch (error) {
+    console.error('Error updating comment:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Delete comment
+app.delete('/api/comments/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { user_id } = req.query; // Get user_id from query params
+    
+    // Verify comment exists and user owns it
+    const { data: existingComment, error: fetchError } = await supabase
+      .from('comments')
+      .select('user_id, media_url')
+      .eq('id', id)
+      .single();
+    
+    if (fetchError) throw fetchError;
+    if (!existingComment) {
+      return res.status(404).json({ error: 'Comment not found' });
+    }
+    
+    if (existingComment.user_id !== user_id) {
+      return res.status(403).json({ error: 'You can only delete your own comments' });
+    }
+    
+    // Delete media file if exists
+    if (existingComment.media_url) {
+      try {
+        await deleteFile(existingComment.media_url, MEDIA_BUCKET_NAME);
+      } catch (mediaError) {
+        console.warn('Could not delete media file:', mediaError);
+        // Continue with comment deletion even if media deletion fails
+      }
+    }
+    
+    // Delete comment
+    const { error: deleteError } = await supabase
+      .from('comments')
+      .delete()
+      .eq('id', id);
+    
+    if (deleteError) throw deleteError;
+    
+    res.json({ success: true, message: 'Comment deleted' });
+  } catch (error) {
+    console.error('Error deleting comment:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Dashboard stats
+app.get('/api/dashboard/stats', optionalAuthenticate, async (req, res) => {
+  try {
+    // If user is authenticated but has no organization, return empty stats
+    if (req.user && !req.user.organizationId) {
+      return res.json({
+        total: 0,
+        byStatus: {},
+        byPriority: {},
+        averageProgress: 0,
+        totalProgress: 0,
+        completed: 0,
+        active: 0
+      });
+    }
+    
+    let queryBuilder = supabase.from('objectives').select('*');
+    
+    // Filter by organization if user is authenticated
+    if (req.user && req.user.organizationId) {
+      queryBuilder = queryBuilder.eq('organization_id', req.user.organizationId);
+    }
+    
+    const { data: allObjectives, error } = await queryBuilder;
+    
+    if (error) throw error;
+    
+    const objectives = allObjectives || [];
     const stats = {
-      total: allObjectives.length,
+      total: objectives.length,
       byStatus: {},
       byPriority: {},
       averageProgress: 0,
@@ -907,7 +1065,7 @@ app.get('/api/dashboard/stats', async (req, res) => {
       active: 0
     };
 
-    allObjectives.forEach(obj => {
+    objectives.forEach(obj => {
       stats.byStatus[obj.status] = (stats.byStatus[obj.status] || 0) + 1;
       stats.byPriority[obj.priority] = (stats.byPriority[obj.priority] || 0) + 1;
       stats.totalProgress += obj.progress_percentage || 0;
@@ -915,7 +1073,7 @@ app.get('/api/dashboard/stats', async (req, res) => {
       if (obj.status === 'Active') stats.active++;
     });
 
-    stats.averageProgress = allObjectives.length > 0 ? stats.totalProgress / allObjectives.length : 0;
+    stats.averageProgress = objectives.length > 0 ? stats.totalProgress / objectives.length : 0;
 
     res.json(stats);
   } catch (error) {
@@ -1176,6 +1334,86 @@ app.put('/api/users/:id', authenticate, requireOrganization, async (req, res) =>
   }
 });
 
+// Upload user avatar
+app.post('/api/users/me/avatar', authenticate, requireOrganization, upload.single('avatar'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file uploaded' });
+    }
+    
+    const userId = req.user.id;
+    
+    // Get current user to delete old avatar
+    const user = await dbGet('SELECT avatar FROM users WHERE id = ?', [userId]);
+    if (user && user.avatar) {
+      try {
+        await deleteFile(user.avatar);
+      } catch (deleteError) {
+        console.warn('Could not delete old avatar:', deleteError);
+        // Continue even if deletion fails
+      }
+    }
+    
+    // Upload to Supabase Storage
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    const ext = path.extname(req.file.originalname);
+    const filename = `avatar-${userId}-${uniqueSuffix}${ext}`;
+    
+    let avatarUrl;
+    try {
+      // Read file buffer
+      const fileBuffer = fs.readFileSync(req.file.path);
+      const { url } = await uploadFile(fileBuffer, filename, 'logos', req.file.mimetype);
+      avatarUrl = url;
+      
+      // Delete local temp file
+      fs.unlinkSync(req.file.path);
+    } catch (uploadError) {
+      // Clean up local file
+      if (fs.existsSync(req.file.path)) {
+        fs.unlinkSync(req.file.path);
+      }
+      throw new Error(`Failed to upload to storage: ${uploadError.message}`);
+    }
+    
+    // Update user avatar
+    await dbRun('UPDATE users SET avatar = ? WHERE id = ?', [avatarUrl, userId]);
+    
+    res.json({ avatar: avatarUrl });
+  } catch (error) {
+    // Clean up local file if there was an error
+    if (req.file && fs.existsSync(req.file.path)) {
+      fs.unlinkSync(req.file.path);
+    }
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get current user's subscriptions
+app.get('/api/users/me/subscriptions', authenticate, requireOrganization, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    
+    // Get subscriptions with objective details using a JOIN query
+    const subscriptions = await dbAll(`
+      SELECT 
+        os.id,
+        os.objective_id,
+        os.created_at,
+        o.title as objective_title
+      FROM objective_subscriptions os
+      INNER JOIN objectives o ON os.objective_id = o.id
+      WHERE os.user_id = ?
+      ORDER BY os.created_at DESC
+    `, [userId]);
+    
+    res.json(subscriptions || []);
+  } catch (error) {
+    console.error('Get subscriptions error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.delete('/api/users/:id', authenticate, authorize('Admin'), requireOrganization, async (req, res) => {
   try {
     await dbRun('DELETE FROM users WHERE id = ?', [req.params.id]);
@@ -1238,8 +1476,41 @@ app.delete('/api/objectives/:id/contributors/:userId', async (req, res) => {
   }
 });
 
-app.get('/api/departments', async (req, res) => {
+app.get('/api/departments', optionalAuthenticate, async (req, res) => {
   try {
+    // If user is authenticated but has no organization, return empty array
+    if (req.user && !req.user.organizationId) {
+      return res.json([]);
+    }
+    
+    // If user is authenticated, filter departments by organization (via users)
+    if (req.user && req.user.organizationId) {
+      // Get department IDs from users in this organization
+      const { data: orgUsers, error: usersError } = await supabase
+        .from('users')
+        .select('department')
+        .eq('organization_id', req.user.organizationId)
+        .not('department', 'is', null);
+      
+      if (usersError) throw usersError;
+      
+      const departmentIds = [...new Set((orgUsers || []).map(u => u.department).filter(Boolean))];
+      
+      if (departmentIds.length > 0) {
+        const { data: departments, error } = await supabase
+          .from('departments')
+          .select('*')
+          .in('id', departmentIds)
+          .order('name');
+        
+        if (error) throw error;
+        return res.json(departments || []);
+      } else {
+        return res.json([]);
+      }
+    }
+    
+    // No authentication - return all (for backwards compatibility, but should require auth)
     const departments = await dbAll('SELECT * FROM departments ORDER BY name');
     res.json(departments);
   } catch (error) {
@@ -1570,11 +1841,11 @@ app.post('/api/company/logo', upload.single('logo'), async (req, res) => {
       const company = await dbGet('SELECT * FROM companies WHERE id = ?', [existing[0].id]);
       res.json({ logo_url: company.logo_url });
     } else {
-      // Create new company with logo
+      // Create new company with logo (no default name - will be set during onboarding)
       const id = uuidv4();
       await dbRun(
         'INSERT INTO companies (id, name, logo_url) VALUES (?, ?, ?)',
-        [id, 'Company', logoUrl]
+        [id, null, logoUrl] // No default name
       );
       
       const company = await dbGet('SELECT * FROM companies WHERE id = ?', [id]);
@@ -1592,6 +1863,33 @@ app.post('/api/company/logo', upload.single('logo'), async (req, res) => {
     } else {
       res.status(500).json({ error: error.message });
     }
+  }
+});
+
+// Media upload endpoint
+app.post('/api/media/upload', mediaUpload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file uploaded' });
+    }
+    
+    const mediaType = req.body.type || (req.file.mimetype.startsWith('audio') ? 'audio' : 'video');
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    const ext = path.extname(req.file.originalname) || (mediaType === 'audio' ? '.webm' : '.webm');
+    const filename = `${mediaType}-${uniqueSuffix}${ext}`;
+    
+    // Upload to Supabase Storage
+    const fileBuffer = Buffer.from(req.file.buffer);
+    const { url } = await uploadFile(fileBuffer, filename, MEDIA_BUCKET_NAME, req.file.mimetype);
+    
+    res.json({ 
+      url,
+      type: mediaType,
+      filename
+    });
+  } catch (error) {
+    console.error('Error uploading media:', error);
+    res.status(500).json({ error: error.message || 'Failed to upload media' });
   }
 });
 
@@ -1622,7 +1920,7 @@ app.get('/api/objectives/:id/comments', async (req, res) => {
 
 app.post('/api/objectives/:id/comments', async (req, res) => {
   try {
-    const { user_id, content } = req.body;
+    const { user_id, content, media_url, media_type } = req.body;
     const objectiveId = req.params.id;
     const id = uuidv4();
     
@@ -1637,7 +1935,9 @@ app.post('/api/objectives/:id/comments', async (req, res) => {
         id,
         objective_id: objectiveId,
         user_id,
-        content
+        content: content || (media_url ? (media_type === 'audio' ? 'Voice note' : 'Video note') : ''),
+        media_url: media_url || null,
+        media_type: media_type || null
       })
       .select()
       .single();
@@ -1826,15 +2126,16 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
     const orgCount = await dbGet('SELECT COUNT(*) as count FROM organizations');
     const isFirstUser = !orgCount || orgCount.count === 0;
     
-    if (isFirstUser && organizationName) {
+    if (isFirstUser) {
       organizationId = uuidv4();
-      const orgSlug = organizationName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+      // Generate a unique slug based on timestamp to avoid conflicts
+      const orgSlug = `org-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
       
       await supabase
         .from('organizations')
         .insert({
           id: organizationId,
-          name: organizationName,
+          name: organizationName || null, // Will be set during onboarding if not provided
           slug: orgSlug
         });
     } else {
@@ -1887,7 +2188,7 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
     
     // Get user with password hash
     const user = await dbGet(
-      'SELECT id, email, name, role, organization_id, password_hash, email_verified FROM users WHERE email = ?',
+      'SELECT id, email, name, role, organization_id, password_hash, email_verified, avatar FROM users WHERE email = ?',
       [email.toLowerCase()]
     );
     
@@ -1934,12 +2235,340 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
         email: user.email,
         name: user.name,
         role: user.role,
-        organizationId: user.organization_id
+        organizationId: user.organization_id,
+        avatar: user.avatar || null
       }
     });
   } catch (error) {
     console.error('Login error:', error);
     res.status(500).json({ error: error.message });
+  }
+});
+
+// Initialize Google OAuth client
+// Note: We'll create the client dynamically to support different redirect URIs
+let googleClient = null;
+
+const createGoogleClient = (redirectUri) => {
+  if (!process.env.GOOGLE_CLIENT_ID || !process.env.GOOGLE_CLIENT_SECRET) {
+    return null;
+  }
+  return new OAuth2Client(
+    process.env.GOOGLE_CLIENT_ID,
+    process.env.GOOGLE_CLIENT_SECRET,
+    redirectUri
+  );
+};
+
+const getGoogleRedirectUri = (req = null) => {
+  // Priority: 1. Explicit env var, 2. Request origin, 3. FRONTEND_URL env, 4. Default localhost
+  if (process.env.GOOGLE_REDIRECT_URI) {
+    return process.env.GOOGLE_REDIRECT_URI;
+  }
+  
+  // Try to get from request origin (for dynamic frontend URL)
+  if (req) {
+    const origin = req.get('origin') || req.get('referer');
+    if (origin) {
+      try {
+        const url = new URL(origin);
+        return `${url.origin}/auth/google/callback`;
+      } catch (e) {
+        // Invalid URL, continue to next option
+      }
+    }
+  }
+  
+  // Fall back to environment variable or default
+  const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
+  return `${frontendUrl}/auth/google/callback`;
+};
+
+// Get Google OAuth URL
+app.get('/api/auth/google', (req, res) => {
+  try {
+    if (!process.env.GOOGLE_CLIENT_ID || !process.env.GOOGLE_CLIENT_SECRET) {
+      return res.status(503).json({ error: 'Google OAuth is not configured. Please set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET environment variables.' });
+    }
+    
+    // Get redirect URI from query param (sent by frontend), request origin, or env
+    let redirectUri = req.query.redirectUri;
+    
+    console.log('Query redirectUri:', req.query.redirectUri);
+    
+    if (!redirectUri) {
+      // Try to get from request origin
+      const origin = req.get('origin');
+      const referer = req.get('referer');
+      console.log('No redirectUri in query, checking origin/referer');
+      
+      if (origin) {
+        try {
+          const url = new URL(origin);
+          redirectUri = `${url.origin}/auth/google/callback`;
+          console.log('Using redirect URI from origin:', redirectUri);
+        } catch (e) {
+          console.warn('Could not parse origin:', origin);
+        }
+      } else if (referer) {
+        try {
+          const url = new URL(referer);
+          redirectUri = `${url.origin}/auth/google/callback`;
+          console.log('Using redirect URI from referer:', redirectUri);
+        } catch (e) {
+          console.warn('Could not parse referer:', referer);
+        }
+      }
+    } else {
+      console.log('Using redirect URI from query param:', redirectUri);
+    }
+    
+    // Fall back to environment variable or default
+    if (!redirectUri) {
+      redirectUri = getGoogleRedirectUri(req);
+      console.log('Using redirect URI from getGoogleRedirectUri:', redirectUri);
+    }
+    
+    console.log('=== Google OAuth Configuration ===');
+    console.log('Redirect URI being used:', redirectUri);
+    console.log('Request origin:', req.get('origin'));
+    console.log('Request referer:', req.get('referer'));
+    console.log('FRONTEND_URL env:', process.env.FRONTEND_URL);
+    console.log('GOOGLE_REDIRECT_URI env:', process.env.GOOGLE_REDIRECT_URI);
+    console.log('Client ID:', process.env.GOOGLE_CLIENT_ID);
+    console.log('==================================');
+    console.log('⚠️  IMPORTANT: Make sure this redirect URI matches EXACTLY in Google Cloud Console:');
+    console.log('   ', redirectUri);
+    console.log('   (Check for trailing slashes, http vs https, port numbers)');
+    console.log('==================================');
+    
+    // Create client with the correct redirect URI
+    const client = createGoogleClient(redirectUri);
+    if (!client) {
+      return res.status(503).json({ error: 'Google OAuth client creation failed' });
+    }
+    
+    const scopes = [
+      'https://www.googleapis.com/auth/userinfo.email',
+      'https://www.googleapis.com/auth/userinfo.profile'
+    ];
+    
+    const authUrl = client.generateAuthUrl({
+      access_type: 'offline',
+      scope: scopes,
+      prompt: 'consent',
+      state: req.query.redirect || '/'
+    });
+    
+    res.json({ 
+      authUrl, 
+      redirectUri,
+      message: 'Make sure this redirect URI matches exactly what is configured in Google Cloud Console'
+    });
+  } catch (error) {
+    console.error('Google OAuth URL generation error:', error);
+    res.status(500).json({ error: 'Failed to generate Google OAuth URL' });
+  }
+});
+
+// Google OAuth callback
+app.post('/api/auth/google/callback', async (req, res) => {
+  try {
+    if (!process.env.GOOGLE_CLIENT_ID || !process.env.GOOGLE_CLIENT_SECRET) {
+      return res.status(503).json({ error: 'Google OAuth is not configured. Please set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET environment variables.' });
+    }
+    
+    const { code, redirectUri } = req.body;
+    
+    if (!code) {
+      return res.status(400).json({ error: 'Authorization code is required' });
+    }
+    
+    // Use provided redirectUri or determine from request
+    const finalRedirectUri = redirectUri || getGoogleRedirectUri(req);
+    console.log('Using redirect URI for token exchange:', finalRedirectUri);
+    
+    // Create client with the correct redirect URI
+    const client = createGoogleClient(finalRedirectUri);
+    if (!client) {
+      return res.status(503).json({ error: 'Google OAuth client creation failed' });
+    }
+    
+    console.log('Exchanging Google OAuth code for tokens...');
+    // Exchange code for tokens
+    const { tokens } = await client.getToken(code);
+    console.log('Tokens received, setting credentials...');
+    client.setCredentials(tokens);
+    
+    // Get user info from Google
+    console.log('Verifying ID token...');
+    const ticket = await client.verifyIdToken({
+      idToken: tokens.id_token,
+      audience: process.env.GOOGLE_CLIENT_ID
+    });
+    
+    const payload = ticket.getPayload();
+    console.log('Google user payload:', { 
+      sub: payload.sub, 
+      email: payload.email, 
+      name: payload.name 
+    });
+    
+    const googleId = payload.sub;
+    const email = payload.email;
+    const name = payload.name || payload.given_name || email.split('@')[0];
+    const picture = payload.picture;
+    
+    if (!email) {
+      return res.status(400).json({ error: 'Email not provided by Google' });
+    }
+    
+    // Check if user exists with this Google ID
+    let user = await dbGet(
+      'SELECT id, email, name, role, organization_id, email_verified, avatar FROM users WHERE google_id = ?',
+      [googleId]
+    );
+    
+    // If not found by Google ID, check by email
+    if (!user) {
+      user = await dbGet(
+        'SELECT id, email, name, role, organization_id, email_verified, google_id, avatar FROM users WHERE email = ?',
+        [email.toLowerCase()]
+      );
+      
+      // If user exists but doesn't have Google ID, link it
+      if (user && !user.google_id) {
+        await supabase
+          .from('users')
+          .update({ 
+            google_id: googleId,
+            email_verified: true, // Google emails are verified
+            avatar: picture || null
+          })
+          .eq('id', user.id);
+        
+        user.google_id = googleId;
+        user.email_verified = true;
+      }
+    }
+    
+    // Create new user if doesn't exist
+    if (!user) {
+      const userId = uuidv4();
+      
+      // Determine organization
+      let organizationId;
+      const orgCount = await dbGet('SELECT COUNT(*) as count FROM organizations');
+      const isFirstUser = !orgCount || orgCount.count === 0;
+      
+      if (isFirstUser) {
+        // Create organization for first user (without default name - will be set during onboarding)
+        organizationId = uuidv4();
+        // Generate a unique slug based on timestamp to avoid conflicts
+        const orgSlug = `org-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+        
+        await supabase
+          .from('organizations')
+          .insert({
+            id: organizationId,
+            name: null, // Will be set during onboarding
+            slug: orgSlug
+          });
+      } else {
+        // Get first organization (or implement org selection)
+        const firstOrg = await dbGet('SELECT id FROM organizations LIMIT 1');
+        if (!firstOrg) {
+          return res.status(400).json({ error: 'No organization found. Please contact an administrator.' });
+        }
+        organizationId = firstOrg.id;
+      }
+      
+      // Create user
+      const now = new Date().toISOString();
+      await supabase
+        .from('users')
+        .insert({
+          id: userId,
+          email: email.toLowerCase(),
+          name,
+          google_id: googleId,
+          email_verified: true, // Google emails are verified
+          organization_id: organizationId,
+          role: isFirstUser ? 'Admin' : 'Team Member',
+          avatar: picture || null,
+          last_login: now
+        });
+      
+      user = {
+        id: userId,
+        email: email.toLowerCase(),
+        name,
+        role: isFirstUser ? 'Admin' : 'Team Member',
+        organization_id: organizationId,
+        email_verified: true
+      };
+    } else {
+      // Update last login and avatar if available
+      const updateData = { 
+        last_login: new Date().toISOString()
+      };
+      if (picture) {
+        updateData.avatar = picture;
+      }
+      await supabase
+        .from('users')
+        .update(updateData)
+        .eq('id', user.id);
+      
+      // Get updated user with avatar
+      const updatedUser = await dbGet(
+        'SELECT id, email, name, role, organization_id, avatar FROM users WHERE id = ?',
+        [user.id]
+      );
+      if (updatedUser) {
+        user.avatar = updatedUser.avatar;
+      }
+    }
+    
+    // Get avatar from database if not already set
+    if (!user.avatar) {
+      const userWithAvatar = await dbGet(
+        'SELECT avatar FROM users WHERE id = ?',
+        [user.id]
+      );
+      if (userWithAvatar) {
+        user.avatar = userWithAvatar.avatar;
+      }
+    }
+    
+    // Generate JWT token
+    const token = generateToken({
+      userId: user.id,
+      email: user.email,
+      role: user.role,
+      organizationId: user.organization_id
+    });
+    
+    console.log('Google OAuth successful, returning token and user');
+    res.json({
+      token,
+      user: {
+        id: user.id,
+        email: user.email,
+        name: user.name,
+        role: user.role,
+        organizationId: user.organization_id,
+        avatar: user.avatar || null
+      }
+    });
+  } catch (error) {
+    console.error('Google OAuth callback error:', error);
+    console.error('Error stack:', error.stack);
+    const errorMessage = error.message || 'Google authentication failed';
+    res.status(500).json({ 
+      error: errorMessage,
+      details: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
   }
 });
 
@@ -2539,6 +3168,18 @@ app.post('/api/invitations', authenticate, requireAdminOrManager, requireOrganiz
       baseUrl
     );
     
+    // Create in-app notification for inviter
+    await createNotification(
+      req.user.id,
+      'invitation_sent',
+      'Invitation Sent',
+      `You've invited ${email} to join ${organization.name} as ${inviteRole}`,
+      null, // objective_id
+      null, // comment_id
+      null, // progress_update_id
+      invitationId // invitation_id
+    );
+    
     const invitation = await dbGet('SELECT * FROM invitations WHERE id = ?', [invitationId]);
     res.status(201).json({
       ...invitation,
@@ -2670,6 +3311,40 @@ app.post('/api/invitations/:token/accept', async (req, res) => {
         accepted_at: now
       })
       .eq('id', invitation.id);
+    
+    // Get inviter and organization details for notifications
+    const inviter = await dbGet('SELECT id, email, name FROM users WHERE id = ?', [invitation.invited_by]);
+    const organization = await dbGet('SELECT name FROM organizations WHERE id = ?', [invitation.organization_id]);
+    
+    // Create in-app notification for inviter
+    if (inviter) {
+      await createNotification(
+        invitation.invited_by,
+        'invitation_accepted',
+        'Invitation Accepted',
+        `${name} (${invitation.email}) has accepted your invitation to join ${organization?.name || 'the organization'}`,
+        null, // objective_id
+        null, // comment_id
+        null, // progress_update_id
+        invitation.id // invitation_id
+      );
+      
+      // Send email confirmation to inviter
+      const baseUrl = process.env.FRONTEND_URL || `${req.protocol}://${req.get('host')}`;
+      try {
+        await sendInvitationAcceptedEmail(
+          inviter.email,
+          inviter.name,
+          name,
+          invitation.email,
+          organization?.name || 'the organization',
+          baseUrl
+        );
+      } catch (emailError) {
+        console.error('Error sending invitation accepted email:', emailError);
+        // Don't fail the request if email fails
+      }
+    }
     
     // Generate token
     const jwtToken = generateToken({
@@ -2823,26 +3498,37 @@ app.put('/api/organizations/:id', authenticate, authorize('Admin'), requireOrgan
       return res.status(403).json({ error: 'Cannot update other organizations' });
     }
     
-    if (!name) {
-      return res.status(400).json({ error: 'Organization name is required' });
+    // If name is provided, update it (required when setting initially)
+    if (name !== undefined) {
+      if (!name || name.trim() === '') {
+        return res.status(400).json({ error: 'Organization name cannot be empty' });
+      }
+      
+      const orgSlug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+      
+      // Check if slug is unique (excluding current org)
+      const existingOrg = await dbGet('SELECT id FROM organizations WHERE slug = ? AND id != ?', [orgSlug, id]);
+      if (existingOrg) {
+        return res.status(400).json({ error: 'Organization with this name already exists' });
+      }
+      
+      await supabase
+        .from('organizations')
+        .update({
+          name: name.trim(),
+          slug: orgSlug,
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', id);
+    } else {
+      // Just update the timestamp if no name provided
+      await supabase
+        .from('organizations')
+        .update({
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', id);
     }
-    
-    const orgSlug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
-    
-    // Check if slug is unique (excluding current org)
-    const existingOrg = await dbGet('SELECT id FROM organizations WHERE slug = ? AND id != ?', [orgSlug, id]);
-    if (existingOrg) {
-      return res.status(400).json({ error: 'Organization with this name already exists' });
-    }
-    
-    await supabase
-      .from('organizations')
-      .update({
-        name,
-        slug: orgSlug,
-        updated_at: new Date().toISOString()
-      })
-      .eq('id', id);
     
     const organization = await dbGet('SELECT * FROM organizations WHERE id = ?', [id]);
     res.json(organization);

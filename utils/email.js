@@ -165,6 +165,60 @@ export async function sendInvitationEmail(email, inviterName, organizationName, 
 }
 
 /**
+ * Send invitation accepted confirmation email to inviter
+ * @param {string} inviterEmail - Email of person who sent invitation
+ * @param {string} inviterName - Name of person who sent invitation
+ * @param {string} acceptedUserName - Name of person who accepted invitation
+ * @param {string} acceptedUserEmail - Email of person who accepted invitation
+ * @param {string} organizationName - Organization name
+ * @param {string} baseUrl - Application base URL
+ */
+export async function sendInvitationAcceptedEmail(inviterEmail, inviterName, acceptedUserName, acceptedUserEmail, organizationName, baseUrl) {
+  const userProfileUrl = `${baseUrl}/people`; // Link to people page where they can see the new user
+  
+  const html = `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <title>Invitation Accepted</title>
+    </head>
+    <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+      <div style="max-width: 600px; margin: 0 auto; padding: 20px;">
+        <h1 style="color: #10b981;">Invitation Accepted!</h1>
+        <p>Hi ${inviterName},</p>
+        <p><strong>${acceptedUserName}</strong> (${acceptedUserEmail}) has accepted your invitation to join <strong>${organizationName}</strong>.</p>
+        <p>They can now access the platform and start collaborating with your team.</p>
+        <p style="text-align: center; margin: 30px 0;">
+          <a href="${userProfileUrl}" style="background-color: #4F46E5; color: white; padding: 12px 24px; text-decoration: none; border-radius: 5px; display: inline-block;">View Team Members</a>
+        </p>
+        <p>If you have any questions, feel free to reach out.</p>
+      </div>
+    </body>
+    </html>
+  `;
+  
+  const text = `
+    Hi ${inviterName},
+    
+    ${acceptedUserName} (${acceptedUserEmail}) has accepted your invitation to join ${organizationName}.
+    
+    They can now access the platform and start collaborating with your team.
+    
+    View your team members: ${userProfileUrl}
+    
+    If you have any questions, feel free to reach out.
+  `;
+  
+  await sendEmail({
+    to: inviterEmail,
+    subject: `${acceptedUserName} has accepted your invitation`,
+    html,
+    text
+  });
+}
+
+/**
  * Send password reset email
  * @param {string} email - User email
  * @param {string} name - User name
